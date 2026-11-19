@@ -1,0 +1,18 @@
+---
+description: KinCare shared product, architecture, safety and collaboration rules
+alwaysApply: true
+---
+
+Read `AGENTS.md` and `docs/KINCARE_ROUND3_MASTER_SPEC.md` before coding. The master spec is the source of truth.
+
+KinCare Round 3 requires two equivalent core applications: Flutter/Dart Android and React/TypeScript PWA. Both must support caregiver and elderly journeys, backed by one shared Supabase project/schema. Never split the product into caregiver-only PWA and elderly-only Android.
+
+Preserve these invariants: caregivers authenticate with Supabase Auth; elderly profiles have no individual login; one caregiver may own multiple elderly profiles and multiple devices; devices belong to caregivers, not one elderly profile; each activity session records both `elderly_profile_id` and `device_id`; Memory Decks contain `created_by_caregiver_id`; Memory Cards have their own primary key and distinct photo/question-audio/answer-audio asset references; MEDIA_ASSETS stores metadata while actual media is in private Supabase Storage; open-ended memory/reminiscence responses do not have a correctness mark.
+
+Android local persistence is SQLite plus app-private media files. PWA local persistence is IndexedDB plus Service Worker/Cache API. Both need retryable, idempotent offline synchronization and manual Sync Now. Do not assume Background Sync works in every browser.
+
+Never expose Supabase service-role secrets, weaken RLS, invent live metrics, leave dead buttons, or claim untested features. The doctor-facing PDF is a factual engagement/activity summary, not a clinical report. Do not claim automatic speech recognition unless implemented and tested.
+
+Respect the assigned branch and file ownership. Do not edit shared Supabase migrations/contracts at the same time as another agent. Inspect Git status before edits and preserve uncommitted work. Never push/merge to `main` without the project owner's approval.
+
+When handing off, state changed files, tests actually run and results, known limitations, commit hash, and any cross-platform/schema impact.
