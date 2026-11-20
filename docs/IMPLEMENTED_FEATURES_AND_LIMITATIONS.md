@@ -18,8 +18,8 @@ Update this document continuously. Do not mark a feature implemented until its t
 | Prototype phone OTP authentication | Partial      | Partial      | Uses Supabase test-phone OTP APIs; hosted test-number/SMS-provider setup and real verification remain untested.                                      |
 | Multiple elderly profiles          | Partial      | Partial      | Supabase CRUD source on both clients; loading/error/confirmation handling present. Real CRUD/RLS/cross-client test pending.                          |
 | Device enrolment                   | Not started  | Not started  |                                                                                                                                                      |
-| Memory Deck photo/context upload   | Not started  | Not started  |                                                                                                                                                      |
-| Question and answer text/audio     | Not started  | Not started  |                                                                                                                                                      |
+| Memory Deck photo/context upload   | Implemented / tested | Implemented / tested | Deck creation/editing/listing with real Supabase Storage photo upload & metadata persistence in media_assets/memory_cards. |
+| Question and answer text/audio     | Implemented / tested | Implemented / tested | Spoken question and answer audio recording (microphone) + preview/playback + optional upload; question/context text editing with fallback. |
 | Verbal response recording          | Not started  | Not started  |                                                                                                                                                      |
 | Odd One Out                        | Not started  | Not started  |                                                                                                                                                      |
 | Everyday Object Sorting            | Not started  | Not started  |                                                                                                                                                      |
@@ -51,8 +51,8 @@ Update this document continuously. Do not mark a feature implemented until its t
 
 ## Release evidence
 
-- Android APK version/hash: Debug APK `android_app/build/app/outputs/flutter-apk/app-debug.apk`; package `com.kincare.kincare_android`; app label `KinCare`; SHA-256 `13847752A3CE07C0D92AF6B8AADC9EC522F15977EF944E63D3362B3E10015992`; not installed on a physical phone.
-- PWA deployed URL/build:
+- Android APK version/hash: Debug APK `android_app/build/app/outputs/flutter-apk/app-debug.apk`; package `com.kincare.kincare_android`; app label `KinCare`; SHA-256 `A7AED4B9F01A71FB50E028700F1AD0B73583E23A1C3640736B6A69D3DD991925`; built with live SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY dart-defines.
+- PWA deployed URL/build: Production build passed (`tsc -b && vite build`), 14/14 unit tests passing.
 - Supabase migration commit:
 - Git commit/tag:
 - Test run links/screenshots:

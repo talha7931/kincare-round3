@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import type { User } from "@supabase/supabase-js";
 import { supabase } from "./lib/supabase";
+import { MemoryDecks } from "./components/MemoryDecks";
 import {
   canResendConfirmation,
   canStartAuthRequest,
@@ -1142,13 +1143,7 @@ function App() {
         )}
 
         {caregiverSection === "memory" && (
-          <section className="content-panel feature-placeholder">
-            <h2>Personal photographs and familiar stories</h2>
-            <p>
-              Memory Deck creation and media upload require the activity
-              implementation. No sample cards or media are shown.
-            </p>
-          </section>
+          <MemoryDecks user={user} selectedProfile={selectedProfile} />
         )}
         {caregiverSection === "activity" && (
           <section className="content-panel feature-placeholder">

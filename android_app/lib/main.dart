@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_theme.dart';
+import 'memory_decks_screen.dart';
 
 const _supabaseUrl = String.fromEnvironment('SUPABASE_URL');
 const _supabasePublishableKey = String.fromEnvironment('SUPABASE_PUBLISHABLE_KEY');
@@ -477,6 +478,7 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
   bool _loading = true;
   bool _profileMutationLoading = false;
   bool _seniorMode = false;
+  String _caregiverSection = 'profiles';
 
   /// Presentation only: which unavailable activity the elderly user opened.
   String? _openActivityKey;
@@ -980,6 +982,26 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
       appBar: AppBar(
         title: Text(_seniorMode ? 'KinCare' : 'KinCare caregiver profiles'),
         actions: [
+          if (!_seniorMode) ...[
+            TextButton(
+              onPressed: () => setState(() => _caregiverSection = 'profiles'),
+              style: TextButton.styleFrom(
+                foregroundColor: _caregiverSection == 'profiles'
+                    ? KinCareColors.forest
+                    : KinCareColors.textMuted,
+              ),
+              child: const Text('Profiles'),
+            ),
+            TextButton(
+              onPressed: () => setState(() => _caregiverSection = 'memory'),
+              style: TextButton.styleFrom(
+                foregroundColor: _caregiverSection == 'memory'
+                    ? KinCareColors.forest
+                    : KinCareColors.textMuted,
+              ),
+              child: const Text('Memory Decks'),
+            ),
+          ],
           TextButton(
             onPressed: () => setState(() {
               _seniorMode = !_seniorMode;
@@ -994,6 +1016,8 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
           ? const Center(child: CircularProgressIndicator())
           : _seniorMode
               ? _buildSeniorMode()
+          : _caregiverSection == 'memory'
+              ? MemoryDecksScreen(user: widget.user, selectedProfile: _selectedProfile)
           : SingleChildScrollView(
               padding: const EdgeInsets.all(16),
               child: Center(
