@@ -21,6 +21,56 @@ type ElderlyProfile = {
   preferred_language: string;
 };
 
+type SeniorActivityKey = "memory" | "odd" | "sorting";
+
+type SeniorActivity = {
+  key: SeniorActivityKey;
+  name: string;
+  description: string;
+  availability: string;
+};
+
+/**
+ * Presentation only. No activity is implemented yet, so every entry explains
+ * why it is unavailable instead of offering a start control.
+ */
+const SENIOR_ACTIVITIES: readonly SeniorActivity[] = [
+  {
+    key: "memory",
+    name: "Memory Decks",
+    description: "Look at familiar photographs and share a memory.",
+    availability: "Available after cards are added",
+  },
+  {
+    key: "odd",
+    name: "Odd One Out",
+    description: "Choose the item that is different.",
+    availability: "Available after setup",
+  },
+  {
+    key: "sorting",
+    name: "Everyday Object Sorting",
+    description: "Place familiar objects in the right group.",
+    availability: "Available after setup",
+  },
+];
+
+const LANGUAGE_LABELS: Record<string, string> = {
+  en: "English",
+  hi: "Hindi",
+  mr: "Marathi",
+};
+
+/** Stored codes are never shown raw; unknown codes fall back to upper case. */
+function languageLabel(code: string) {
+  return LANGUAGE_LABELS[code] ?? code.toUpperCase();
+}
+
+function profileInitial(displayName: string) {
+  const trimmed = displayName.trim();
+  return trimmed ? trimmed.charAt(0).toUpperCase() : "\u2014";
+}
+
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -42,6 +92,9 @@ function App() {
   const [profileName, setProfileName] = useState("");
   const [profileLanguage, setProfileLanguage] = useState("en");
   const [appMode, setAppMode] = useState<"caregiver" | "elderly">("caregiver");
+  const [openActivity, setOpenActivity] = useState<SeniorActivityKey | null>(
+    null,
+  );
   const [caregiverSection, setCaregiverSection] = useState<
     "overview" | "profiles" | "memory" | "activity" | "reports" | "wellbeing"
   >("overview");
@@ -124,7 +177,7 @@ function App() {
   async function ensureCaregiverProfile() {
     if (!user) return;
     const { data, error: caregiverError } = await supabase
-      .from("CAREGIVERS")
+      .from("caregivers")
       .select("display_name")
       .eq("id", user.id)
       .maybeSingle();
@@ -137,7 +190,7 @@ function App() {
 
     const fallbackName = user.user_metadata?.display_name ?? "";
     const { error: insertError } = await supabase
-      .from("CAREGIVERS")
+      .from("caregivers")
       .insert({ id: user.id, display_name: fallbackName || null });
     if (insertError) throw insertError;
     setCaregiverName(fallbackName);
@@ -147,7 +200,7 @@ function App() {
     setProfilesLoading(true);
     try {
       const { data, error: profilesError } = await supabase
-        .from("ELDERLY_PROFILES")
+        .from("elderly_profiles")
         .select("id, display_name, preferred_language")
         .order("created_at", { ascending: true });
 
@@ -328,7 +381,7 @@ function App() {
     if (!user) return;
     setError("");
     const { error: updateError } = await supabase
-      .from("CAREGIVERS")
+      .from("caregivers")
       .update({ display_name: caregiverName.trim() || null })
       .eq("id", user.id);
     if (updateError) setError(updateError.message);
@@ -341,7 +394,7 @@ function App() {
     setProfileMutationLoading(true);
     try {
       const { error: insertError } = await supabase
-        .from("ELDERLY_PROFILES")
+        .from("elderly_profiles")
         .insert({
           caregiver_id: user.id,
           display_name: profileName.trim(),
@@ -370,7 +423,7 @@ function App() {
     setProfileMutationLoading(true);
     try {
       const { error: updateError } = await supabase
-        .from("ELDERLY_PROFILES")
+        .from("elderly_profiles")
         .update({
           display_name: selectedProfile.display_name.trim(),
           preferred_language: selectedProfile.preferred_language,
@@ -396,7 +449,7 @@ function App() {
     setProfileMutationLoading(true);
     try {
       const { error: deleteError } = await supabase
-        .from("ELDERLY_PROFILES")
+        .from("elderly_profiles")
         .delete()
         .eq("id", profile.id);
 
@@ -425,9 +478,14 @@ function App() {
   if (!user) {
     return (
       <main className="auth-shell">
-        <section className="auth-panel">
-          <p className="eyebrow">KinCare</p>
-          <h1>
+        <section className="auth-panel" aria-labelledby="auth-title">
+          <div className="auth-brand">
+            <span className="brand-mark" aria-hidden="true">
+              K
+            </span>
+            <span className="auth-brand-name">KinCare</span>
+          </div>
+          <h1 id="auth-title">
             {authMethod === "phone"
               ? "Caregiver phone sign in"
               : mode === "login"
@@ -437,10 +495,12 @@ function App() {
           <div
             className="auth-method-choice"
             aria-label="Authentication method"
+            role="group"
           >
             <button
               type="button"
               className={authMethod === "email" ? "active" : ""}
+              aria-pressed={authMethod === "email"}
               onClick={() => {
                 setAuthMethod("email");
                 setError("");
@@ -452,6 +512,7 @@ function App() {
             <button
               type="button"
               className={authMethod === "phone" ? "active" : ""}
+              aria-pressed={authMethod === "phone"}
               onClick={() => {
                 setAuthMethod("phone");
                 setError("");
@@ -463,12 +524,12 @@ function App() {
           </div>
 
           {authMethod === "phone" ? (
-            <form onSubmit={submitPhone}>
+            <form onSubmit={submitPhone} className="auth-form">
               <div className="prototype-auth-note">
                 Prototype test authentication uses a configured Supabase test
                 phone number and fixed test OTP. No SMS is sent.
               </div>
-              <label>
+              <label className="field">
                 International phone number
                 <input
                   type="tel"
@@ -480,7 +541,7 @@ function App() {
                 />
               </label>
               {phoneOtpSent && (
-                <label>
+                <label className="field">
                   6-digit test OTP
                   <input
                     inputMode="numeric"
@@ -504,6 +565,7 @@ function App() {
                 </p>
               )}
               <button
+                className="btn btn-primary auth-submit"
                 type="submit"
                 disabled={authSubmitting || !phoneNumber.trim()}
               >
@@ -515,9 +577,9 @@ function App() {
               </button>
             </form>
           ) : (
-            <form onSubmit={submitAuth}>
+            <form onSubmit={submitAuth} className="auth-form">
               {mode === "register" && (
-                <label>
+                <label className="field">
                   Display name
                   <input
                     value={displayName}
@@ -526,7 +588,7 @@ function App() {
                   />
                 </label>
               )}
-              <label>
+              <label className="field">
                 Email
                 <input
                   type="email"
@@ -535,7 +597,7 @@ function App() {
                   required
                 />
               </label>
-              <label>
+              <label className="field">
                 Password
                 <input
                   type="password"
@@ -555,7 +617,11 @@ function App() {
                   {error}
                 </p>
               )}
-              <button type="submit" disabled={authSubmitting}>
+              <button
+                className="btn btn-primary auth-submit"
+                type="submit"
+                disabled={authSubmitting}
+              >
                 {authSubmitting
                   ? "Please wait..."
                   : mode === "login"
@@ -564,31 +630,33 @@ function App() {
               </button>
             </form>
           )}
-          {authMethod === "email" && signupPendingEmail && (
-            <button
-              className="text-button"
-              type="button"
-              disabled={authSubmitting || resendCooldownSeconds > 0}
-              onClick={resendConfirmation}
-            >
-              {resendCooldownSeconds > 0
-                ? `Resend confirmation in ${resendCooldownSeconds}s`
-                : "Resend confirmation email"}
-            </button>
-          )}
           {authMethod === "email" && (
-            <button
-              className="text-button"
-              type="button"
-              onClick={() => {
-                setError("");
-                setAuthNotice("");
-                setSignupPendingEmail("");
-                setMode(mode === "login" ? "register" : "login");
-              }}
-            >
-              {mode === "login" ? "Create an account" : "Back to sign in"}
-            </button>
+            <div className="auth-links">
+              {signupPendingEmail && (
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={authSubmitting || resendCooldownSeconds > 0}
+                  onClick={resendConfirmation}
+                >
+                  {resendCooldownSeconds > 0
+                    ? `Resend confirmation in ${resendCooldownSeconds}s`
+                    : "Resend confirmation email"}
+                </button>
+              )}
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => {
+                  setError("");
+                  setAuthNotice("");
+                  setSignupPendingEmail("");
+                  setMode(mode === "login" ? "register" : "login");
+                }}
+              >
+                {mode === "login" ? "Create an account" : "Back to sign in"}
+              </button>
+            </div>
           )}
         </section>
       </main>
@@ -605,6 +673,10 @@ function App() {
   };
 
   if (appMode === "elderly") {
+    const activeActivity =
+      SENIOR_ACTIVITIES.find((activity) => activity.key === openActivity) ??
+      null;
+
     return (
       <main className="senior-shell">
         <header className="senior-header">
@@ -615,7 +687,7 @@ function App() {
           >
             Caregiver mode
           </button>
-          <div>
+          <div className="senior-heading">
             <p>KinCare</p>
             <h1>
               {selectedProfile
@@ -634,7 +706,38 @@ function App() {
           </p>
         )}
 
-        {!selectedProfile ? (
+        {openActivity ? (
+          <section
+            className="senior-content"
+            aria-label="Activity availability"
+          >
+            <div className="senior-choice-heading senior-choice-heading--pair">
+              <button
+                type="button"
+                className="senior-back"
+                onClick={() => setOpenActivity(null)}
+              >
+                Back
+              </button>
+              <button
+                type="button"
+                className="senior-home"
+                onClick={() => {
+                  setOpenActivity(null);
+                  setSelectedProfile(null);
+                }}
+              >
+                Home
+              </button>
+            </div>
+            <div className="senior-not-setup">
+              <h2>{activeActivity?.name ?? "Activity"}</h2>
+              <p>
+                This activity is not ready yet. Ask your caregiver to set it up.
+              </p>
+            </div>
+          </section>
+        ) : !selectedProfile ? (
           <section className="senior-content" aria-labelledby="choose-person">
             <h2 id="choose-person">Who is using KinCare?</h2>
             {profiles.length === 0 ? (
@@ -651,7 +754,7 @@ function App() {
                     onClick={() => setSelectedProfile(profile)}
                   >
                     <span className="profile-initial" aria-hidden="true">
-                      {profile.display_name.charAt(0).toUpperCase()}
+                      {profileInitial(profile.display_name)}
                     </span>
                     <strong>{profile.display_name}</strong>
                   </button>
@@ -665,7 +768,10 @@ function App() {
               <button
                 type="button"
                 className="senior-back"
-                onClick={() => setSelectedProfile(null)}
+                onClick={() => {
+                  setOpenActivity(null);
+                  setSelectedProfile(null);
+                }}
               >
                 Back
               </button>
@@ -673,37 +779,32 @@ function App() {
               <button
                 type="button"
                 className="senior-home"
-                onClick={() => setSelectedProfile(null)}
+                onClick={() => {
+                  setOpenActivity(null);
+                  setSelectedProfile(null);
+                }}
               >
                 Home
               </button>
             </div>
 
-            <div className="senior-activity-grid">
-              <article className="senior-activity-card memory">
-                <span className="activity-label">Reminiscence</span>
-                <h3>Memory Decks</h3>
-                <p>Look at familiar photographs and share a memory.</p>
-                <button type="button" disabled>
-                  Available after cards are added
+            <div className="senior-activity-board">
+              {SENIOR_ACTIVITIES.map((activity) => (
+                <button
+                  type="button"
+                  className="senior-activity"
+                  key={activity.key}
+                  onClick={() => setOpenActivity(activity.key)}
+                >
+                  <span className="senior-activity-name">{activity.name}</span>
+                  <span className="senior-activity-description">
+                    {activity.description}
+                  </span>
+                  <span className="senior-activity-availability">
+                    {activity.availability}
+                  </span>
                 </button>
-              </article>
-              <article className="senior-activity-card odd">
-                <span className="activity-label">Spot the difference</span>
-                <h3>Odd One Out</h3>
-                <p>Choose the item that is different.</p>
-                <button type="button" disabled>
-                  Available after setup
-                </button>
-              </article>
-              <article className="senior-activity-card sorting">
-                <span className="activity-label">Sort together</span>
-                <h3>Object Sorting</h3>
-                <p>Place familiar objects in the right group.</p>
-                <button type="button" disabled>
-                  Available after setup
-                </button>
-              </article>
+              ))}
             </div>
           </section>
         )}
@@ -738,6 +839,7 @@ function App() {
             <button
               type="button"
               className={caregiverSection === section ? "active" : ""}
+              aria-current={caregiverSection === section ? "page" : undefined}
               key={section}
               onClick={() => setCaregiverSection(section)}
             >
@@ -762,19 +864,21 @@ function App() {
 
       <section className="caregiver-workspace">
         <header className="workspace-header">
-          <div>
-            <p>KinCare dashboard</p>
-            <h1>{sectionTitles[caregiverSection]}</h1>
-          </div>
+          <h1>{sectionTitles[caregiverSection]}</h1>
           <div className="mode-switch" aria-label="Application mode">
             <button
               type="button"
               className="active"
+              aria-pressed="true"
               onClick={() => setAppMode("caregiver")}
             >
               Caregiver
             </button>
-            <button type="button" onClick={() => setAppMode("elderly")}>
+            <button
+              type="button"
+              aria-pressed="false"
+              onClick={() => setAppMode("elderly")}
+            >
               Elderly
             </button>
           </div>
@@ -787,45 +891,70 @@ function App() {
         )}
 
         {caregiverSection === "overview" && (
-          <section className="dashboard-grid">
-            <article className="summary-card">
-              <span>Elderly profiles</span>
-              <strong>{profiles.length}</strong>
+          <section className="overview-layout">
+            <div className="identity-surface">
+              <span className="identity-initial" aria-hidden="true">
+                {profileInitial(selectedProfile?.display_name ?? "")}
+              </span>
+              <div>
+                <strong
+                  className={`identity-name ${selectedProfile ? "" : "identity-name--empty"}`}
+                >
+                  {selectedProfile?.display_name ?? "None selected"}
+                </strong>
+                <p className="identity-language">
+                  {selectedProfile
+                    ? `Preferred language: ${languageLabel(selectedProfile.preferred_language)}`
+                    : "Choose a person to see their language and activities."}
+                </p>
+              </div>
               <button
                 type="button"
-                onClick={() => setCaregiverSection("profiles")}
-              >
-                Manage profiles
-              </button>
-            </article>
-            <article className="summary-card">
-              <span>Selected profile</span>
-              <strong>
-                {selectedProfile?.display_name ?? "None selected"}
-              </strong>
-              <button
-                type="button"
+                className="btn btn-primary identity-action"
                 onClick={() => setCaregiverSection("profiles")}
               >
                 Choose profile
               </button>
-            </article>
-            <article className="summary-card tone">
-              <span>Current mode</span>
-              <strong>Caregiver</strong>
-              <button type="button" onClick={() => setAppMode("elderly")}>
-                Open senior view
-              </button>
-            </article>
+            </div>
 
-            <section className="content-panel overview-profile-panel">
-              <div className="panel-heading">
-                <div>
-                  <p>Profiles</p>
-                  <h2>People you support</h2>
-                </div>
+            <div className="support-column">
+              <div className="support-row">
+                <span className="support-label">Elderly profiles</span>
+                <span className="support-value">{profiles.length}</span>
                 <button
                   type="button"
+                  className="btn btn-quiet"
+                  onClick={() => setCaregiverSection("profiles")}
+                >
+                  Manage profiles
+                </button>
+              </div>
+              <div className="support-row">
+                <span className="support-label">Current mode</span>
+                <span className="support-value">Caregiver</span>
+                <button
+                  type="button"
+                  className="btn btn-quiet"
+                  onClick={() => setAppMode("elderly")}
+                >
+                  Open senior view
+                </button>
+              </div>
+              <div className="support-row">
+                <h2>Participation history</h2>
+                <p className="empty-state support-empty">
+                  No activity records are loaded. Participation and reports
+                  appear here after activity sessions are recorded.
+                </p>
+              </div>
+            </div>
+
+            <section className="content-panel people-panel">
+              <div className="panel-heading">
+                <h2>People you support</h2>
+                <button
+                  type="button"
+                  className="btn btn-quiet"
                   onClick={() => setCaregiverSection("profiles")}
                 >
                   View all
@@ -836,38 +965,27 @@ function App() {
                   No elderly profiles have been added.
                 </p>
               ) : (
-                <div className="profile-card-grid">
+                <div className="profile-list">
                   {profiles.map((profile) => (
                     <button
                       type="button"
-                      className={`profile-card ${selectedProfile?.id === profile.id ? "selected" : ""}`}
+                      className={`profile-row ${selectedProfile?.id === profile.id ? "selected" : ""}`}
                       key={profile.id}
                       onClick={() => setSelectedProfile(profile)}
                     >
                       <span className="profile-initial" aria-hidden="true">
-                        {profile.display_name.charAt(0).toUpperCase()}
+                        {profileInitial(profile.display_name)}
                       </span>
                       <span>
                         <strong>{profile.display_name}</strong>
-                        <small>{profile.preferred_language}</small>
+                        <span className="profile-language">
+                          {languageLabel(profile.preferred_language)}
+                        </span>
                       </span>
                     </button>
                   ))}
                 </div>
               )}
-            </section>
-
-            <section className="content-panel activity-overview">
-              <div className="panel-heading">
-                <div>
-                  <p>Activity</p>
-                  <h2>Participation history</h2>
-                </div>
-              </div>
-              <p className="empty-state">
-                No activity records are loaded. Participation and reports appear
-                here after activity sessions are recorded.
-              </p>
             </section>
           </section>
         )}
@@ -877,13 +995,10 @@ function App() {
             <div className="management-grid">
               <section className="content-panel">
                 <div className="panel-heading">
-                  <div>
-                    <p>New person</p>
-                    <h2>Add an elderly profile</h2>
-                  </div>
+                  <h2>Add an elderly profile</h2>
                 </div>
                 <form onSubmit={createProfile} className="management-form">
-                  <label>
+                  <label className="field">
                     Display name
                     <input
                       value={profileName}
@@ -891,7 +1006,7 @@ function App() {
                       required
                     />
                   </label>
-                  <label>
+                  <label className="field">
                     Preferred language
                     <select
                       value={profileLanguage}
@@ -904,7 +1019,11 @@ function App() {
                       <option value="mr">Marathi</option>
                     </select>
                   </label>
-                  <button type="submit" disabled={profileMutationLoading}>
+                  <button
+                    className="btn btn-primary"
+                    type="submit"
+                    disabled={profileMutationLoading}
+                  >
                     {profileMutationLoading ? "Saving..." : "Add profile"}
                   </button>
                 </form>
@@ -915,7 +1034,7 @@ function App() {
                     onSubmit={saveCaregiverName}
                     className="management-form"
                   >
-                    <label>
+                    <label className="field">
                       Display name
                       <input
                         value={caregiverName}
@@ -924,17 +1043,16 @@ function App() {
                         }
                       />
                     </label>
-                    <button type="submit">Save name</button>
+                    <button className="btn btn-primary" type="submit">
+                      Save name
+                    </button>
                   </form>
                 </div>
               </section>
 
               <section className="content-panel">
                 <div className="panel-heading">
-                  <div>
-                    <p>People</p>
-                    <h2>Elderly profiles</h2>
-                  </div>
+                  <h2>Elderly profiles</h2>
                 </div>
                 {profilesLoading ? (
                   <p className="empty-state" role="status">
@@ -945,7 +1063,7 @@ function App() {
                     No elderly profiles have been added.
                   </p>
                 ) : (
-                  <div className="profile-management-list">
+                  <div className="profile-list">
                     {profiles.map((profile) => (
                       <button
                         type="button"
@@ -954,11 +1072,13 @@ function App() {
                         onClick={() => setSelectedProfile(profile)}
                       >
                         <span className="profile-initial" aria-hidden="true">
-                          {profile.display_name.charAt(0).toUpperCase()}
+                          {profileInitial(profile.display_name)}
                         </span>
                         <span>
                           <strong>{profile.display_name}</strong>
-                          <small>{profile.preferred_language}</small>
+                          <span className="profile-language">
+                            {languageLabel(profile.preferred_language)}
+                          </span>
                         </span>
                       </button>
                     ))}
@@ -968,7 +1088,7 @@ function App() {
                 {selectedProfile && (
                   <form className="edit-panel" onSubmit={updateProfile}>
                     <h3>Edit selected profile</h3>
-                    <label>
+                    <label className="field">
                       Display name
                       <input
                         value={selectedProfile.display_name}
@@ -981,7 +1101,7 @@ function App() {
                         required
                       />
                     </label>
-                    <label>
+                    <label className="field">
                       Preferred language
                       <select
                         value={selectedProfile.preferred_language}
@@ -998,11 +1118,15 @@ function App() {
                       </select>
                     </label>
                     <div className="actions">
-                      <button type="submit" disabled={profileMutationLoading}>
+                      <button
+                        className="btn btn-primary"
+                        type="submit"
+                        disabled={profileMutationLoading}
+                      >
                         {profileMutationLoading ? "Saving..." : "Save changes"}
                       </button>
                       <button
-                        className="danger"
+                        className="btn btn-danger"
                         type="button"
                         disabled={profileMutationLoading}
                         onClick={() => deleteProfile(selectedProfile)}
@@ -1019,7 +1143,6 @@ function App() {
 
         {caregiverSection === "memory" && (
           <section className="content-panel feature-placeholder">
-            <span>Memory Decks</span>
             <h2>Personal photographs and familiar stories</h2>
             <p>
               Memory Deck creation and media upload require the activity
@@ -1029,7 +1152,6 @@ function App() {
         )}
         {caregiverSection === "activity" && (
           <section className="content-panel feature-placeholder">
-            <span>Activity history</span>
             <h2>No participation data loaded</h2>
             <p>
               Activity sessions and responses will appear here after real
@@ -1039,7 +1161,6 @@ function App() {
         )}
         {caregiverSection === "reports" && (
           <section className="content-panel feature-placeholder">
-            <span>Healthcare report</span>
             <h2>Report export is not available yet</h2>
             <p>
               This area will export a factual engagement summary, not a clinical
@@ -1049,7 +1170,6 @@ function App() {
         )}
         {caregiverSection === "wellbeing" && (
           <section className="content-panel wellbeing-panel">
-            <span>General support</span>
             <h2>Caregiver wellbeing</h2>
             <p>
               Take regular breaks, ask for practical support, and connect with
