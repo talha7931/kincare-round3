@@ -4,6 +4,8 @@ import { supabase } from "../lib/supabase";
 import {
   oddOneOutIsCorrect,
   oddOneOutRounds,
+  cognitiveGameActivityKeys,
+  type CognitiveGameActivityKey,
   sortingGame,
   sortingIsCorrect,
   speechLocale,
@@ -16,7 +18,7 @@ import {
 
 type CognitiveGamesProps = {
   profile: ElderlyProfile;
-  game: "odd" | "sorting";
+  game: CognitiveGameActivityKey;
   onBack: () => void;
   onHome: () => void;
 };
@@ -38,8 +40,8 @@ function speak(text: string, language: string) {
 }
 
 export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGamesProps) {
-  const sorting = game === "sorting";
-  const activityKey = sorting ? "everyday_object_sorting" : "odd_one_out";
+  const sorting = game === cognitiveGameActivityKeys.sorting;
+  const activityKey = game;
   const title = sorting ? "Everyday Object Sorting" : "Odd One Out";
   const [stage, setStage] = useState<"intro" | "playing" | "complete">("intro");
   const [busy, setBusy] = useState(false);

@@ -47,4 +47,11 @@ void main() {
     expect(sortingIsCorrect('fruit', 'fruit'), isTrue);
     expect(sortingIsCorrect('vegetable', 'fruit'), isFalse);
   });
+
+  test('canonical activity keys are accepted by the elderly game router', () {
+    expect(isCognitiveGameActivityKey(oddOneOutActivityKey), isTrue);
+    expect(isCognitiveGameActivityKey(everydayObjectSortingActivityKey), isTrue);
+    expect(isCognitiveGameActivityKey('odd'), isFalse);
+    expect(isCognitiveGameActivityKey('sorting'), isFalse);
+  });
 }

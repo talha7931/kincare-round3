@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  cognitiveGameActivityKeys,
+  isCognitiveGameActivityKey,
   oddOneOutIsCorrect,
   oddOneOutRounds,
   sortingGame,
@@ -32,5 +34,12 @@ describe("shared cognitive game content", () => {
     expect(speechLocale("en")).toBe("en-IN");
     expect(speechLocale("hi")).toBe("en-IN");
     expect(speechLocale("mr")).toBe("en-IN");
+  });
+
+  it("routes only the canonical activity type keys to the games", () => {
+    expect(isCognitiveGameActivityKey(cognitiveGameActivityKeys.oddOneOut)).toBe(true);
+    expect(isCognitiveGameActivityKey(cognitiveGameActivityKeys.sorting)).toBe(true);
+    expect(isCognitiveGameActivityKey("odd")).toBe(false);
+    expect(isCognitiveGameActivityKey("sorting")).toBe(false);
   });
 });

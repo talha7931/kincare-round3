@@ -7,6 +7,10 @@ import { SeniorMemoryViewer } from "./components/SeniorMemoryViewer";
 import { CognitiveGames } from "./components/CognitiveGames";
 import { CaregiverActivityHistory } from "./components/CaregiverActivityHistory";
 import {
+  cognitiveGameActivityKeys,
+  isCognitiveGameActivityKey,
+} from "./lib/cognitiveGames";
+import {
   canResendConfirmation,
   canStartAuthRequest,
   getAuthErrorMessage,
@@ -25,7 +29,10 @@ type ElderlyProfile = {
   preferred_language: string;
 };
 
-type SeniorActivityKey = "memory" | "odd" | "sorting";
+type SeniorActivityKey =
+  | "memory"
+  | typeof cognitiveGameActivityKeys.oddOneOut
+  | typeof cognitiveGameActivityKeys.sorting;
 
 type SeniorActivity = {
   key: SeniorActivityKey;
@@ -45,13 +52,13 @@ const SENIOR_ACTIVITIES: readonly SeniorActivity[] = [
     availability: "Available after cards are added",
   },
   {
-    key: "odd",
+    key: cognitiveGameActivityKeys.oddOneOut,
     name: "Odd One Out",
     description: "Choose the item that is different.",
     availability: "Ready to play",
   },
   {
-    key: "sorting",
+    key: cognitiveGameActivityKeys.sorting,
     name: "Everyday Object Sorting",
     description: "Place familiar objects in the right group.",
     availability: "Ready to play",
@@ -718,7 +725,7 @@ function App() {
               setSelectedProfile(null);
             }}
           />
-        ) : openActivity && (openActivity === "odd" || openActivity === "sorting") && selectedProfile ? (
+        ) : isCognitiveGameActivityKey(openActivity) && selectedProfile ? (
           <CognitiveGames
             key={`${selectedProfile.id}-${openActivity}`}
             profile={selectedProfile}

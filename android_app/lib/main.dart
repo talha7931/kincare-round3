@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'app_theme.dart';
 import 'activity_history_screen.dart';
 import 'cognitive_games_screen.dart';
+import 'cognitive_game_rules.dart';
 import 'elderly_memory_screen.dart';
 import 'memory_decks_screen.dart';
 
@@ -669,7 +670,7 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
         );
       }
 
-      if ((_openActivityKey == 'odd' || _openActivityKey == 'sorting') &&
+      if (isCognitiveGameActivityKey(_openActivityKey) &&
           selectedProfile != null) {
         return CognitiveGamesScreen(
           selectedProfile: selectedProfile,
@@ -1269,13 +1270,13 @@ const List<_SeniorActivity> _seniorActivities = [
     'Available after cards are added',
   ),
   _SeniorActivity(
-    'odd',
+    oddOneOutActivityKey,
     'Odd One Out',
     'Choose the item that is different.',
     'Ready to play',
   ),
   _SeniorActivity(
-    'sorting',
+    everydayObjectSortingActivityKey,
     'Everyday Object Sorting',
     'Place familiar objects in the right group.',
     'Ready to play',

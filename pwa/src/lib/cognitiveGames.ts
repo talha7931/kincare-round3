@@ -1,5 +1,16 @@
 import content from "../../../android_app/assets/cognitive_games.json";
 
+export const cognitiveGameActivityKeys = {
+  oddOneOut: "odd_one_out",
+  sorting: "everyday_object_sorting",
+} as const;
+export type CognitiveGameActivityKey =
+  (typeof cognitiveGameActivityKeys)[keyof typeof cognitiveGameActivityKeys];
+
+export function isCognitiveGameActivityKey(key: string | null): key is CognitiveGameActivityKey {
+  return key === cognitiveGameActivityKeys.oddOneOut || key === cognitiveGameActivityKeys.sorting;
+}
+
 export type GameItem = {
   id: string;
   label: string;

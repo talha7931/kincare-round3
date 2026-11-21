@@ -45,8 +45,8 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
   String? _selectedSortingItem;
   final Map<String, String> _responseIds = {};
 
-  bool get _isSorting => widget.gameKey == 'sorting';
-  String get _activityKey => _isSorting ? 'everyday_object_sorting' : 'odd_one_out';
+  bool get _isSorting => widget.gameKey == everydayObjectSortingActivityKey;
+  String get _activityKey => widget.gameKey;
   String get _title => _isSorting ? 'Everyday Object Sorting' : 'Odd One Out';
   // Bundled prompts and object labels are English.
   String get _language => 'en-IN';
