@@ -7,11 +7,13 @@ import 'package:kincare_android/cognitive_game_rules.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  test('Odd One Out rounds have four choices and one expected object', () async {
+  test('Odd One Out rounds have four choices and one expected object',
+      () async {
     final content = jsonDecode(
       await rootBundle.loadString('assets/cognitive_games.json'),
     ) as Map<String, dynamic>;
-    final rounds = (content['odd_one_out'] as List).cast<Map<String, dynamic>>();
+    final rounds =
+        (content['odd_one_out'] as List).cast<Map<String, dynamic>>();
     expect(rounds.length, greaterThanOrEqualTo(3));
     for (final round in rounds) {
       final items = (round['items'] as List).cast<Map<String, dynamic>>();
@@ -41,7 +43,8 @@ void main() {
     }
   });
 
-  test('structured activity response correctness is exact and non-clinical', () {
+  test('structured activity response correctness is exact and non-clinical',
+      () {
     expect(oddOneOutIsCorrect('chair', 'chair'), isTrue);
     expect(oddOneOutIsCorrect('apple', 'chair'), isFalse);
     expect(sortingIsCorrect('fruit', 'fruit'), isTrue);
@@ -50,8 +53,39 @@ void main() {
 
   test('canonical activity keys are accepted by the elderly game router', () {
     expect(isCognitiveGameActivityKey(oddOneOutActivityKey), isTrue);
-    expect(isCognitiveGameActivityKey(everydayObjectSortingActivityKey), isTrue);
+    expect(
+        isCognitiveGameActivityKey(everydayObjectSortingActivityKey), isTrue);
     expect(isCognitiveGameActivityKey('odd'), isFalse);
     expect(isCognitiveGameActivityKey('sorting'), isFalse);
+  });
+
+  test('speech uses the selected profile locale and Hindi bundled content',
+      () async {
+    expect(speechLocale('hi'), 'hi-IN');
+    expect(speechLocale('hi-IN'), 'hi-IN');
+    expect(speechLocale('mr'), 'mr-IN');
+    expect(speechLocale(null), 'hi-IN');
+    expect(speechLocale('en'), 'en-IN');
+
+    final content = jsonDecode(
+      await rootBundle.loadString('assets/cognitive_games.json'),
+    ) as Map<String, dynamic>;
+    final rounds =
+        (content['odd_one_out'] as List).cast<Map<String, dynamic>>();
+    expect(
+      spokenText(
+        ((rounds.first['spoken'] as Map)['hi'] as Map)['instruction'],
+        'hi',
+      ),
+      contains('फल'),
+    );
+    final sorting = content['everyday_object_sorting'] as Map<String, dynamic>;
+    expect(
+      spokenText(
+        ((sorting['spoken'] as Map)['hi'] as Map)['instruction'],
+        'hi',
+      ),
+      contains('हर चीज़'),
+    );
   });
 }

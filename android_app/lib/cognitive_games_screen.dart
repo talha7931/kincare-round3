@@ -48,8 +48,15 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
   bool get _isSorting => widget.gameKey == everydayObjectSortingActivityKey;
   String get _activityKey => widget.gameKey;
   String get _title => _isSorting ? 'Everyday Object Sorting' : 'Odd One Out';
-  // Bundled prompts and object labels are English.
-  String get _language => 'en-IN';
+  String get _languageCode =>
+      supportedSpeechLanguage(widget.selectedProfile['preferred_language']?.toString());
+  String get _language => speechLocale(_languageCode);
+
+  String _spoken(Object? translations, {String fallback = ''}) => spokenText(
+        translations,
+        _languageCode,
+        fallback: fallback,
+      );
 
   @override
   void initState() {
@@ -164,6 +171,7 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
       'completed_at': DateTime.now().toUtc().toIso8601String(),
     }).eq('id', _sessionId!);
     if (mounted) setState(() { _stage = 'complete'; _feedback = 'Thank you for taking part. You can enjoy another activity whenever you like.'; });
+    await _speak(spokenCompletion(_languageCode));
   }
 
   Future<void> _leaveActivity({required bool home}) async {
@@ -191,12 +199,15 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
     try {
       await _saveResponses([_oddResponse(round, itemId)]);
       final correct = itemId == round['expected_item_id'];
-      if (mounted) setState(() {
-        _oddResponseSaved = true;
-        _feedback = correct
-            ? 'Well done! ${round['explanation']}'
-            : 'That’s okay. ${round['explanation']}';
-      });
+      if (mounted) {
+        setState(() {
+          _oddResponseSaved = true;
+          _feedback = correct
+              ? 'Well done! ${round['explanation']}'
+              : 'That’s okay. ${round['explanation']}';
+        });
+      }
+      await _speak('${spokenEncouragement(_languageCode, correct: correct)} ${_spoken((round['spoken'] as Map?)?[_languageCode]?['explanation'], fallback: round['explanation'].toString())}');
       if (_roundIndex == 2) await _completeSession();
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
@@ -210,12 +221,16 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
     setState(() { _busy = true; _error = null; });
     try {
       await _saveResponses([_oddResponse(round, _selectedOddItem!)]);
-      if (mounted) setState(() {
-        _oddResponseSaved = true;
-        _feedback = _selectedOddItem == round['expected_item_id']
-            ? 'Well done! ${round['explanation']}'
-            : 'That’s okay. ${round['explanation']}';
-      });
+      if (mounted) {
+        setState(() {
+          _oddResponseSaved = true;
+          _feedback = _selectedOddItem == round['expected_item_id']
+              ? 'Well done! ${round['explanation']}'
+              : 'That’s okay. ${round['explanation']}';
+        });
+      }
+      final correct = _selectedOddItem == round['expected_item_id'];
+      await _speak('${spokenEncouragement(_languageCode, correct: correct)} ${_spoken((round['spoken'] as Map?)?[_languageCode]?['explanation'], fallback: round['explanation'].toString())}');
       if (_roundIndex == 2) await _completeSession();
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
@@ -277,7 +292,6 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
           final rounds = (content['odd_one_out'] as List).cast<Map<String, dynamic>>();
           final sorting = content['everyday_object_sorting'] as Map<String, dynamic>;
           final round = rounds[_roundIndex];
-          final instruction = _isSorting ? sorting['instruction'].toString() : round['instruction'].toString();
           return SingleChildScrollView(
             padding: const EdgeInsets.all(KinCareSpace.x5),
             child: Center(
@@ -299,7 +313,7 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
                   if (_stage == 'intro') _panel(Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
                     Text(_isSorting ? sorting['instruction'].toString() : rounds.first['instruction'].toString(), textAlign: TextAlign.center, style: const TextStyle(fontSize: 25, height: 1.4, fontWeight: FontWeight.w700, color: KinCareColors.forest)),
                     const SizedBox(height: KinCareSpace.x4),
-                    _bigButton('🔊  Listen to Instructions', () => _speak(instruction), primary: false),
+                    _bigButton('🔊  Listen to Instructions', () => _speak(_isSorting ? _spoken((sorting['spoken'] as Map?)?[_languageCode]?['instruction'], fallback: sorting['instruction'].toString()) : _spoken((rounds.first['spoken'] as Map?)?[_languageCode]?['instruction'], fallback: rounds.first['instruction'].toString())), primary: false),
                     const SizedBox(height: KinCareSpace.x3),
                     _bigButton(_busy ? 'Starting…' : 'Begin Activity', _busy ? null : _startSession),
                   ])),
@@ -328,7 +342,7 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
       const SizedBox(height: KinCareSpace.x3),
       Text(round['instruction'].toString(), textAlign: TextAlign.center, style: const TextStyle(fontSize: 25, height: 1.4, fontWeight: FontWeight.w700, color: KinCareColors.forest)),
       const SizedBox(height: KinCareSpace.x3),
-      _bigButton('🔊  Listen again', () => _speak(round['instruction'].toString()), primary: false),
+      _bigButton('🔊  Listen again', () => _speak(_spoken((round['spoken'] as Map?)?[_languageCode]?['instruction'], fallback: round['instruction'].toString())), primary: false),
       const SizedBox(height: KinCareSpace.x4),
       GridView.count(
         crossAxisCount: 2,
@@ -344,7 +358,7 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
             label: 'Choose ${item['label']}',
             child: OutlinedButton(
               onPressed: _busy || _oddResponseSaved ? null : () {
-                _speak(item['label'].toString());
+                _speak(_spoken(item['spoken'], fallback: item['label'].toString()));
                 _chooseOdd(round, item['id'].toString());
               },
               style: OutlinedButton.styleFrom(
@@ -383,30 +397,44 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
     return _panel(Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       Text(sorting['instruction'].toString(), textAlign: TextAlign.center, style: const TextStyle(fontSize: 25, height: 1.4, fontWeight: FontWeight.w700, color: KinCareColors.forest)),
       const SizedBox(height: KinCareSpace.x3),
-      _bigButton('🔊  Listen again', () => _speak(sorting['instruction'].toString()), primary: false),
+      _bigButton('🔊  Listen again', () => _speak(_spoken((sorting['spoken'] as Map?)?[_languageCode]?['instruction'], fallback: sorting['instruction'].toString())), primary: false),
       const SizedBox(height: KinCareSpace.x4),
       for (final item in items) ...[
         _sortingItem(item, categories),
         const SizedBox(height: KinCareSpace.x2),
       ],
       const SizedBox(height: KinCareSpace.x3),
-      Row(children: [
-        for (var index = 0; index < categories.length; index++) ...[
-          if (index > 0) const SizedBox(width: KinCareSpace.x3),
-          Expanded(child: _bigButton(
-            '${categories[index]['illustration']}  ${categories[index]['label']}',
-            _selectedSortingItem == null || _busy ? null : () {
-              setState(() {
-                _placements[_selectedSortingItem!] = categories[index]['id'].toString();
-                _selectedSortingItem = null;
-                _feedback = 'Object placed. Choose it again if you would like to move it.';
-              });
-              _speak(categories[index]['label'].toString());
-            },
+      LayoutBuilder(builder: (context, constraints) {
+        final buttons = categories.map<Widget>((category) {
+          final button = _bigButton(
+            '${category['illustration']}  ${category['label']}',
+            _selectedSortingItem == null || _busy
+                ? null
+                : () {
+                    final selectedItem = items.firstWhere(
+                      (item) => item['id'] == _selectedSortingItem,
+                    );
+                    setState(() {
+                      _placements[_selectedSortingItem!] = category['id'].toString();
+                      _selectedSortingItem = null;
+                      _feedback = 'Object placed. Choose it again if you would like to move it.';
+                    });
+                    _speak(spokenPlacement(
+                      _languageCode,
+                      _spoken(selectedItem['spoken'], fallback: selectedItem['label'].toString()),
+                      _spoken(category['spoken'], fallback: category['label'].toString()),
+                    ));
+                  },
             primary: false,
-          )),
-        ],
-      ]),
+          );
+          return constraints.maxWidth < 520
+              ? Padding(padding: const EdgeInsets.only(bottom: KinCareSpace.x2), child: button)
+              : Expanded(child: button);
+        }).toList();
+        return constraints.maxWidth < 520
+            ? Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: buttons)
+            : Row(children: [buttons[0], const SizedBox(width: KinCareSpace.x3), buttons[1]]);
+      }),
       if (_feedback != null) ...[const SizedBox(height: KinCareSpace.x3), Text(_feedback!, textAlign: TextAlign.center, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600, color: KinCareColors.forest))],
       if (_error != null) ...[const SizedBox(height: KinCareSpace.x2), _bigButton('Try saving again', _busy ? null : () => _finishSorting(sorting), primary: false)],
       const SizedBox(height: KinCareSpace.x4),
@@ -423,7 +451,7 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
         onPressed: () => setState(() {
           _selectedSortingItem = item['id'].toString();
           _feedback = 'Choose a group for ${item['label']}.';
-          _speak(item['label'].toString());
+          _speak(_spoken(item['spoken'], fallback: item['label'].toString()));
         }),
         style: OutlinedButton.styleFrom(
           backgroundColor: _selectedSortingItem == item['id'] ? KinCareColors.paleSage : KinCareColors.offWhite,

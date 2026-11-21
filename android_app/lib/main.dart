@@ -9,6 +9,7 @@ import 'cognitive_games_screen.dart';
 import 'cognitive_game_rules.dart';
 import 'elderly_memory_screen.dart';
 import 'memory_decks_screen.dart';
+import 'caregiver_navigation_actions.dart';
 
 const _supabaseUrl = String.fromEnvironment('SUPABASE_URL');
 const _supabasePublishableKey = String.fromEnvironment('SUPABASE_PUBLISHABLE_KEY');
@@ -1010,45 +1011,20 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(_seniorMode ? 'KinCare' : 'KinCare caregiver profiles'),
+        title: Text(MediaQuery.sizeOf(context).width < 700
+            ? 'KinCare'
+            : _seniorMode ? 'KinCare' : 'KinCare caregiver profiles'),
         actions: [
-          if (!_seniorMode) ...[
-            TextButton(
-              onPressed: () => setState(() => _caregiverSection = 'profiles'),
-              style: TextButton.styleFrom(
-                foregroundColor: _caregiverSection == 'profiles'
-                    ? KinCareColors.forest
-                    : KinCareColors.textMuted,
-              ),
-              child: const Text('Profiles'),
-            ),
-            TextButton(
-              onPressed: () => setState(() => _caregiverSection = 'memory'),
-              style: TextButton.styleFrom(
-                foregroundColor: _caregiverSection == 'memory'
-                    ? KinCareColors.forest
-                    : KinCareColors.textMuted,
-              ),
-              child: const Text('Memory Decks'),
-            ),
-            TextButton(
-              onPressed: () => setState(() => _caregiverSection = 'activity'),
-              style: TextButton.styleFrom(
-                foregroundColor: _caregiverSection == 'activity'
-                    ? KinCareColors.forest
-                    : KinCareColors.textMuted,
-              ),
-              child: const Text('Activity history'),
-            ),
-          ],
-          TextButton(
-            onPressed: () => setState(() {
+          CaregiverNavigationActions(
+            seniorMode: _seniorMode,
+            caregiverSection: _caregiverSection,
+            onSectionSelected: (section) => setState(() => _caregiverSection = section),
+            onToggleMode: () => setState(() {
               _seniorMode = !_seniorMode;
               _openActivityKey = null;
             }),
-            child: Text(_seniorMode ? 'Caregiver mode' : 'Elderly mode'),
+            onSignOut: _signOut,
           ),
-          IconButton(onPressed: _signOut, tooltip: 'Sign out', icon: const Icon(Icons.logout)),
         ],
       ),
       body: _loading

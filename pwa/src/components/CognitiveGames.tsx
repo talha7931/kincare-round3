@@ -9,6 +9,8 @@ import {
   sortingGame,
   sortingIsCorrect,
   speechLocale,
+  spokenText,
+  supportedSpeechLanguage,
 } from "../lib/cognitiveGames";
 import {
   completeActivitySession,
@@ -30,9 +32,9 @@ type PendingOddResponse = {
   isCorrect: boolean;
 };
 
-function speak(text: string, language: string) {
+function speak(text: string, language: string, queue = false) {
   if (!("speechSynthesis" in window)) return false;
-  window.speechSynthesis.cancel();
+  if (!queue) window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = speechLocale(language);
   window.speechSynthesis.speak(utterance);
@@ -54,11 +56,15 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
   const [selectedSortingItem, setSelectedSortingItem] = useState<string | null>(null);
   const [placements, setPlacements] = useState<Record<string, string>>({});
   const responseIds = useRef<Record<string, string>>({});
-  const language = profile.preferred_language;
+  const language = supportedSpeechLanguage(profile.preferred_language);
   const round = oddOneOutRounds[roundIndex];
+  const roundSpeech = round.spoken?.[language];
+  const sortingSpeech = sortingGame.spoken?.[language];
 
   const playInstruction = () => {
-    const text = sorting ? sortingGame.instruction : round.instruction;
+    const text = sorting
+      ? sortingSpeech?.instruction ?? sortingGame.instruction
+      : roundSpeech?.instruction ?? round.instruction;
     if (!speak(text, language)) setError("Audio is unavailable. Please read the instruction shown on screen.");
   };
 
@@ -76,7 +82,7 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
     }
   };
 
-  const finishSession = async () => {
+  const finishSession = async (announce = true) => {
     if (!sessionId) return;
     setBusy(true);
     setError("");
@@ -84,6 +90,14 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
       await completeActivitySession(sessionId);
       setStage("complete");
       setFeedback("Thank you for taking part. You can enjoy another activity whenever you like.");
+      const completion = sorting
+        ? sortingSpeech?.complete ?? "Activity complete. Thank you for taking part."
+        : language === "mr"
+          ? "उपक्रम पूर्ण झाला. सहभागी झाल्याबद्दल धन्यवाद."
+          : language === "en"
+            ? "Activity complete. Thank you for taking part."
+            : "गतिविधि पूरी हुई। भाग लेने के लिए धन्यवाद।";
+      speak(completion, language, !announce);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The activity could not be marked complete. Please try again.");
     } finally {
@@ -137,10 +151,12 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
     try {
       await saveActivityResponses(sessionId, [response]);
       setSavedOddResponse(true);
+      const spokenExplanation = roundSpeech?.explanation ?? round.explanation;
       setFeedback(isCorrect
         ? `Well done! ${round.explanation}`
         : `That’s okay. ${round.explanation}`);
-      if (roundIndex === oddOneOutRounds.length - 1) await finishSession();
+      speak(`${language === "hi" ? isCorrect ? "बहुत अच्छा।" : "कोई बात नहीं।" : language === "mr" ? isCorrect ? "छान!" : "काही हरकत नाही." : isCorrect ? "Well done!" : "That is okay."} ${spokenExplanation}`, language);
+      if (roundIndex === oddOneOutRounds.length - 1) await finishSession(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Your answer could not be saved. Please try again.");
     } finally {
@@ -172,7 +188,8 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
       setFeedback(response.isCorrect
         ? `Well done! ${round.explanation}`
         : `That’s okay. ${round.explanation}`);
-      if (roundIndex === oddOneOutRounds.length - 1) await finishSession();
+      speak(`${language === "hi" ? response.isCorrect ? "बहुत अच्छा।" : "कोई बात नहीं।" : language === "mr" ? response.isCorrect ? "छान!" : "काही हरकत नाही." : response.isCorrect ? "Well done!" : "That is okay."} ${roundSpeech?.explanation ?? round.explanation}`, language);
+      if (roundIndex === oddOneOutRounds.length - 1) await finishSession(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Your answer could not be saved. Please try again.");
     } finally {
@@ -185,6 +202,11 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
     setPlacements((current) => ({ ...current, [selectedSortingItem]: categoryId }));
     const item = sortingGame.items.find((candidate) => candidate.id === selectedSortingItem);
     setFeedback(item ? `${item.label} placed. You can move it by choosing it again.` : "Object placed.");
+    const category = sortingGame.categories.find((candidate) => candidate.id === categoryId);
+    if (item && category) {
+      const pattern = sortingSpeech?.placed ?? "{item} placed in {category}. You can change it if you like.";
+      speak(pattern.replace("{item}", spokenText(item.spoken, language, item.label)).replace("{category}", spokenText(category.spoken, language, category.label)), language);
+    }
     setSelectedSortingItem(null);
   };
 
@@ -214,6 +236,7 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
       await completeActivitySession(sessionId);
       setFeedback("Thank you for sorting these familiar foods.");
       setStage("complete");
+      speak(sortingSpeech?.complete ?? "Activity complete. Thank you for taking part.", language);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Your choices could not be saved. Please try again.");
     } finally {
@@ -257,7 +280,7 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
                 className={`cognitive-object ${selectedItemId === item.id ? "is-selected" : ""}`}
                 disabled={busy || savedOddResponse}
                 onClick={() => {
-                  if (speak(item.label, language)) setError("");
+                  if (speak(spokenText(item.spoken, language, item.label), language)) setError("");
                   void recordOddChoice(item.id);
                 }}
                 aria-label={`Choose ${item.label}`}
@@ -305,7 +328,7 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
                   onClick={() => {
                     setSelectedSortingItem(item.id);
                     setFeedback(`Choose a group for ${item.label}.`);
-                    if (speak(item.label, language)) setError("");
+                    if (speak(spokenText(item.spoken, language, item.label), language)) setError("");
                   }}
                   aria-pressed={selectedSortingItem === item.id}
                 >
@@ -324,7 +347,7 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
                 className="sorting-category-btn"
                 disabled={!selectedSortingItem || busy}
                 onClick={() => {
-                  if (speak(category.label, language)) setError("");
+                  if (speak(spokenText(category.spoken, language, category.label), language)) setError("");
                   placeSortingItem(category.id);
                 }}
               >

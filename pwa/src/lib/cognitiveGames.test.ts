@@ -7,6 +7,8 @@ import {
   sortingGame,
   sortingIsCorrect,
   speechLocale,
+  spokenText,
+  supportedSpeechLanguage,
 } from "./cognitiveGames";
 
 describe("shared cognitive game content", () => {
@@ -32,8 +34,14 @@ describe("shared cognitive game content", () => {
 
   it("uses the selected profile language for spoken instructions", () => {
     expect(speechLocale("en")).toBe("en-IN");
-    expect(speechLocale("hi")).toBe("en-IN");
-    expect(speechLocale("mr")).toBe("en-IN");
+    expect(speechLocale("hi")).toBe("hi-IN");
+    expect(speechLocale("hi-IN")).toBe("hi-IN");
+    expect(speechLocale("mr")).toBe("mr-IN");
+    expect(speechLocale(undefined)).toBe("hi-IN");
+    expect(supportedSpeechLanguage("en")).toBe("en");
+    expect(spokenText(oddOneOutRounds[0].items[0].spoken, "hi")).toBe("सेब");
+    expect(oddOneOutRounds[0].spoken?.hi.instruction).toContain("फल");
+    expect(sortingGame.spoken?.hi.instruction).toContain("हर चीज़");
   });
 
   it("routes only the canonical activity type keys to the games", () => {

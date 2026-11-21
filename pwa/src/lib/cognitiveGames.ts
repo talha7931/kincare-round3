@@ -16,12 +16,14 @@ export type GameItem = {
   label: string;
   illustration: string;
   category_id?: string;
+  spoken?: Record<string, string>;
 };
 
 export type OddRound = {
   id: string;
   instruction: string;
   explanation: string;
+  spoken?: Record<string, { instruction: string; explanation: string }>;
   expected_item_id: string;
   items: GameItem[];
 };
@@ -29,6 +31,7 @@ export type OddRound = {
 export const oddOneOutRounds = content.odd_one_out as OddRound[];
 export const sortingGame = content.everyday_object_sorting as {
   instruction: string;
+  spoken?: Record<string, { instruction: string; placed: string; complete: string }>;
   categories: GameItem[];
   items: GameItem[];
 };
@@ -41,7 +44,20 @@ export function sortingIsCorrect(selectedCategoryId: string, expectedCategoryId:
   return selectedCategoryId === expectedCategoryId;
 }
 
-export function speechLocale(_languageCode: string) {
-  // All bundled instructions and labels are currently English.
-  return "en-IN";
+export function supportedSpeechLanguage(languageCode: string | null | undefined) {
+  const code = languageCode?.toLowerCase().split(/[-_]/)[0];
+  return code === "en" || code === "hi" || code === "mr" ? code : "hi";
+}
+
+export function speechLocale(languageCode: string | null | undefined) {
+  return `${supportedSpeechLanguage(languageCode)}-IN`;
+}
+
+export function spokenText(
+  translations: Record<string, string> | undefined,
+  languageCode: string | null | undefined,
+  fallback = "",
+) {
+  const language = supportedSpeechLanguage(languageCode);
+  return translations?.[language] ?? fallback;
 }
