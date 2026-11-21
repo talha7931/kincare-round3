@@ -16,26 +16,41 @@ Use the exact fields and relationships in `docs/KINCARE_ROUND3_MASTER_SPEC.md`, 
 
 ## Stable activity response payloads
 
-Use JSON objects with a version field so clients can evolve safely. Proposed baseline:
+Use JSON objects with a version field so clients can evolve safely. The Phase 3 games use these payloads and the existing `response_index` / `is_correct` columns:
 
 ```json
 {
   "schema_version": 1,
   "activity_type": "odd_one_out",
-  "selected_item_id": "item-uuid",
-  "expected_item_id": "other-uuid"
+  "round_id": "fruit-chair",
+  "selected_item_id": "chair",
+  "expected_item_id": "chair"
 }
 ```
 
 ```json
 {
   "schema_version": 1,
-  "activity_type": "object_sorting",
-  "placements": [
-    { "item_id": "item-uuid", "category_id": "category-uuid" }
-  ]
+  "activity_type": "everyday_object_sorting",
+  "item_id": "apple",
+  "selected_category_id": "fruit",
+  "expected_category_id": "fruit"
 }
 ```
+
+Odd One Out writes one response per round; `response_index` is the zero-based
+round index and `is_correct` records whether the selected item matches the
+round's expected item. Everyday Object Sorting writes one response per object
+when the elderly user confirms the completed sort; `response_index` is the
+zero-based object index and `is_correct` records whether its final category
+matches the intended category. Sorting choices remain editable in local screen
+state until the user finishes, so corrections do not overwrite append-only
+cloud responses.
+
+Both games use the existing `ACTIVITY_TYPES.stable_key` values
+`odd_one_out` and `everyday_object_sorting`. A session references the active
+profile and a caregiver-owned `ENROLLED_DEVICES` row. No Phase 3 schema changes
+are required.
 
 ```json
 {

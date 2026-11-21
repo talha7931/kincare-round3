@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_theme.dart';
+import 'activity_history_screen.dart';
+import 'cognitive_games_screen.dart';
 import 'elderly_memory_screen.dart';
 import 'memory_decks_screen.dart';
 
@@ -481,7 +483,7 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
   bool _seniorMode = false;
   String _caregiverSection = 'profiles';
 
-  /// Presentation only: which unavailable activity the elderly user opened.
+  /// Which elderly activity is currently open.
   String? _openActivityKey;
 
   @override
@@ -658,6 +660,20 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
       if (_openActivityKey == 'memory' && selectedProfile != null) {
         return ElderlyMemoryScreen(
           selectedProfile: selectedProfile,
+          onBack: () => setState(() => _openActivityKey = null),
+          onHome: () => setState(() {
+            _openActivityKey = null;
+            _selectedProfileId = null;
+            _selectedProfile = null;
+          }),
+        );
+      }
+
+      if ((_openActivityKey == 'odd' || _openActivityKey == 'sorting') &&
+          selectedProfile != null) {
+        return CognitiveGamesScreen(
+          selectedProfile: selectedProfile,
+          gameKey: _openActivityKey!,
           onBack: () => setState(() => _openActivityKey = null),
           onHome: () => setState(() {
             _openActivityKey = null;
@@ -1014,6 +1030,15 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
               ),
               child: const Text('Memory Decks'),
             ),
+            TextButton(
+              onPressed: () => setState(() => _caregiverSection = 'activity'),
+              style: TextButton.styleFrom(
+                foregroundColor: _caregiverSection == 'activity'
+                    ? KinCareColors.forest
+                    : KinCareColors.textMuted,
+              ),
+              child: const Text('Activity history'),
+            ),
           ],
           TextButton(
             onPressed: () => setState(() {
@@ -1031,6 +1056,8 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
               ? _buildSeniorMode()
           : _caregiverSection == 'memory'
               ? MemoryDecksScreen(user: widget.user, selectedProfile: _selectedProfile)
+          : _caregiverSection == 'activity'
+              ? CaregiverActivityHistoryScreen(profiles: _profiles)
           : SingleChildScrollView(
               padding: const EdgeInsets.all(16),
               child: Center(
@@ -1224,8 +1251,7 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
   }
 }
 
-/// One entry in the elderly activity board. None of them are implemented yet,
-/// so the availability line is part of the model rather than a start control.
+/// One entry in the elderly activity board.
 class _SeniorActivity {
   const _SeniorActivity(this.key, this.name, this.description, this.availability);
 
@@ -1246,13 +1272,13 @@ const List<_SeniorActivity> _seniorActivities = [
     'odd',
     'Odd One Out',
     'Choose the item that is different.',
-    'Available after setup',
+    'Ready to play',
   ),
   _SeniorActivity(
     'sorting',
     'Everyday Object Sorting',
     'Place familiar objects in the right group.',
-    'Available after setup',
+    'Ready to play',
   ),
 ];
 

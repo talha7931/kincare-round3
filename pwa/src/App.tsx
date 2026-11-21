@@ -4,6 +4,8 @@ import type { User } from "@supabase/supabase-js";
 import { supabase } from "./lib/supabase";
 import { MemoryDecks } from "./components/MemoryDecks";
 import { SeniorMemoryViewer } from "./components/SeniorMemoryViewer";
+import { CognitiveGames } from "./components/CognitiveGames";
+import { CaregiverActivityHistory } from "./components/CaregiverActivityHistory";
 import {
   canResendConfirmation,
   canStartAuthRequest,
@@ -33,8 +35,7 @@ type SeniorActivity = {
 };
 
 /**
- * Presentation only. No activity is implemented yet, so every entry explains
- * why it is unavailable instead of offering a start control.
+ * The activity board exposes the shared Phase 2 and Phase 3 journeys.
  */
 const SENIOR_ACTIVITIES: readonly SeniorActivity[] = [
   {
@@ -47,13 +48,13 @@ const SENIOR_ACTIVITIES: readonly SeniorActivity[] = [
     key: "odd",
     name: "Odd One Out",
     description: "Choose the item that is different.",
-    availability: "Available after setup",
+    availability: "Ready to play",
   },
   {
     key: "sorting",
     name: "Everyday Object Sorting",
     description: "Place familiar objects in the right group.",
-    availability: "Available after setup",
+    availability: "Ready to play",
   },
 ];
 
@@ -717,6 +718,17 @@ function App() {
               setSelectedProfile(null);
             }}
           />
+        ) : openActivity && (openActivity === "odd" || openActivity === "sorting") && selectedProfile ? (
+          <CognitiveGames
+            key={`${selectedProfile.id}-${openActivity}`}
+            profile={selectedProfile}
+            game={openActivity}
+            onBack={() => setOpenActivity(null)}
+            onHome={() => {
+              setOpenActivity(null);
+              setSelectedProfile(null);
+            }}
+          />
         ) : openActivity ? (
           <section
             className="senior-content"
@@ -1156,13 +1168,7 @@ function App() {
           <MemoryDecks user={user} selectedProfile={selectedProfile} />
         )}
         {caregiverSection === "activity" && (
-          <section className="content-panel feature-placeholder">
-            <h2>No participation data loaded</h2>
-            <p>
-              Activity sessions and responses will appear here after real
-              sessions are recorded and synchronized.
-            </p>
-          </section>
+          <CaregiverActivityHistory profiles={profiles} />
         )}
         {caregiverSection === "reports" && (
           <section className="content-panel feature-placeholder">

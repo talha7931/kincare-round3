@@ -23,8 +23,15 @@ Record test date, platform/device/browser, build/commit, tester, steps, expected
 
 ## C. Cognitive activities
 
-- [ ] Odd One Out displays items and records user selection.
-- [ ] Object Sorting supports object-to-category interaction and records placements.
+- [ ] Odd One Out starts an enrolled-device session for the selected profile and the `odd_one_out` activity type.
+- [ ] Odd One Out records correct and incorrect selections with round index, selected item, expected item, timestamp and nullable correctness.
+- [ ] Odd One Out instruction audio can be replayed; unavailable speech has a readable instruction fallback.
+- [ ] Odd One Out advances through each round and completes the session only after responses are saved.
+- [ ] Everyday Object Sorting starts an enrolled-device session for the selected profile and the `everyday_object_sorting` activity type.
+- [ ] Everyday Object Sorting supports tap-to-select, tap-to-place and changing a placement before submit.
+- [ ] Everyday Object Sorting records one final response per object with selected/expected categories and correctness.
+- [ ] Both games can be exited as abandoned and completed sessions show as completed.
+- [ ] Caregiver activity history shows profile, activity, date, status and saved response summaries.
 - [ ] Touch targets, text and audio instructions are usable on target devices.
 - [ ] Sessions and responses are associated with correct profile and device.
 

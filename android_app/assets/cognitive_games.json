@@ -1,0 +1,52 @@
+{
+  "odd_one_out": [
+    {
+      "id": "fruit-chair",
+      "instruction": "Look at these things. Which one is not a fruit?",
+      "expected_item_id": "chair",
+      "items": [
+        { "id": "apple", "label": "Apple", "illustration": "🍎" },
+        { "id": "banana", "label": "Banana", "illustration": "🍌" },
+        { "id": "mango", "label": "Mango", "illustration": "🥭" },
+        { "id": "chair", "label": "Chair", "illustration": "🪑" }
+      ]
+    },
+    {
+      "id": "animals-bus",
+      "instruction": "Which one is not an animal?",
+      "expected_item_id": "bus",
+      "items": [
+        { "id": "cat", "label": "Cat", "illustration": "🐈" },
+        { "id": "dog", "label": "Dog", "illustration": "🐕" },
+        { "id": "cow", "label": "Cow", "illustration": "🐄" },
+        { "id": "bus", "label": "Bus", "illustration": "🚌" }
+      ]
+    },
+    {
+      "id": "clothes-pot",
+      "instruction": "Which one is not something we wear?",
+      "expected_item_id": "pot",
+      "items": [
+        { "id": "shirt", "label": "Shirt", "illustration": "👕" },
+        { "id": "shoes", "label": "Shoes", "illustration": "👟" },
+        { "id": "hat", "label": "Hat", "illustration": "🧢" },
+        { "id": "pot", "label": "Cooking pot", "illustration": "🍲" }
+      ]
+    }
+  ],
+  "everyday_object_sorting": {
+    "instruction": "Place each object in the group where it belongs.",
+    "categories": [
+      { "id": "fruit", "label": "Fruits", "illustration": "🍎" },
+      { "id": "vegetable", "label": "Vegetables", "illustration": "🥕" }
+    ],
+    "items": [
+      { "id": "apple", "label": "Apple", "illustration": "🍎", "category_id": "fruit" },
+      { "id": "banana", "label": "Banana", "illustration": "🍌", "category_id": "fruit" },
+      { "id": "mango", "label": "Mango", "illustration": "🥭", "category_id": "fruit" },
+      { "id": "carrot", "label": "Carrot", "illustration": "🥕", "category_id": "vegetable" },
+      { "id": "potato", "label": "Potato", "illustration": "🥔", "category_id": "vegetable" },
+      { "id": "cabbage", "label": "Cabbage", "illustration": "🥬", "category_id": "vegetable" }
+    ]
+  }
+}
