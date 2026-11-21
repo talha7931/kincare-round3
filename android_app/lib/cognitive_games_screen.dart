@@ -194,8 +194,8 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
       if (mounted) setState(() {
         _oddResponseSaved = true;
         _feedback = correct
-            ? 'Well done! You found the different object.'
-            : 'That’s okay. Let’s look at these objects together.';
+            ? 'Well done! ${round['explanation']}'
+            : 'That’s okay. ${round['explanation']}';
       });
       if (_roundIndex == 2) await _completeSession();
     } catch (error) {
@@ -213,8 +213,8 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
       if (mounted) setState(() {
         _oddResponseSaved = true;
         _feedback = _selectedOddItem == round['expected_item_id']
-            ? 'Well done! You found the different object.'
-            : 'That’s okay. Let’s look at these objects together.';
+            ? 'Well done! ${round['explanation']}'
+            : 'That’s okay. ${round['explanation']}';
       });
       if (_roundIndex == 2) await _completeSession();
     } catch (error) {

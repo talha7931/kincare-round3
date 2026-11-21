@@ -136,8 +136,8 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
       await saveActivityResponses(sessionId, [response]);
       setSavedOddResponse(true);
       setFeedback(isCorrect
-        ? "Well done! You found the different object."
-        : "That’s okay. Let’s look at these objects together.");
+        ? `Well done! ${round.explanation}`
+        : `That’s okay. ${round.explanation}`);
       if (roundIndex === oddOneOutRounds.length - 1) await finishSession();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Your answer could not be saved. Please try again.");
@@ -168,8 +168,8 @@ export function CognitiveGames({ profile, game, onBack, onHome }: CognitiveGames
       await saveActivityResponses(sessionId, [response]);
       setSavedOddResponse(true);
       setFeedback(response.isCorrect
-        ? "Well done! You found the different object."
-        : "That’s okay. Let’s look at these objects together.");
+        ? `Well done! ${round.explanation}`
+        : `That’s okay. ${round.explanation}`);
       if (roundIndex === oddOneOutRounds.length - 1) await finishSession();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Your answer could not be saved. Please try again.");

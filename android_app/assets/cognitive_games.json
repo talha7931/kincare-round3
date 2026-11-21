@@ -3,6 +3,7 @@
     {
       "id": "fruit-chair",
       "instruction": "Look at these things. Which one is not a fruit?",
+      "explanation": "A chair is different because the apple, banana, and mango are fruits.",
       "expected_item_id": "chair",
       "items": [
         { "id": "apple", "label": "Apple", "illustration": "🍎" },
@@ -14,6 +15,7 @@
     {
       "id": "animals-bus",
       "instruction": "Which one is not an animal?",
+      "explanation": "A bus is different because the cat, dog, and cow are animals.",
       "expected_item_id": "bus",
       "items": [
         { "id": "cat", "label": "Cat", "illustration": "🐈" },
@@ -25,6 +27,7 @@
     {
       "id": "clothes-pot",
       "instruction": "Which one is not something we wear?",
+      "explanation": "The cooking pot is different because the shirt, shoes, and hat are things we wear.",
       "expected_item_id": "pot",
       "items": [
         { "id": "shirt", "label": "Shirt", "illustration": "👕" },

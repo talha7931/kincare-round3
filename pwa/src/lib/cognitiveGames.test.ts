@@ -12,6 +12,7 @@ describe("shared cognitive game content", () => {
     expect(oddOneOutRounds.length).toBeGreaterThanOrEqual(3);
     for (const round of oddOneOutRounds) {
       expect(round.items).toHaveLength(4);
+      expect(round.explanation.length).toBeGreaterThan(0);
       expect(round.items.filter((item) => item.id === round.expected_item_id)).toHaveLength(1);
     }
     expect(oddOneOutIsCorrect("chair", "chair")).toBe(true);

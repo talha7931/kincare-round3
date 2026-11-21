@@ -16,6 +16,7 @@ void main() {
     for (final round in rounds) {
       final items = (round['items'] as List).cast<Map<String, dynamic>>();
       expect(items, hasLength(4));
+      expect(round['explanation'], isNotEmpty);
       expect(
         items.where((item) => item['id'] == round['expected_item_id']),
         hasLength(1),

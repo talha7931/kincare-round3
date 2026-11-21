@@ -10,6 +10,7 @@ export type GameItem = {
 export type OddRound = {
   id: string;
   instruction: string;
+  explanation: string;
   expected_item_id: string;
   items: GameItem[];
 };
