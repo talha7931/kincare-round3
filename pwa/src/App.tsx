@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import type { User } from "@supabase/supabase-js";
 import { supabase } from "./lib/supabase";
 import { MemoryDecks } from "./components/MemoryDecks";
+import { SeniorMemoryViewer } from "./components/SeniorMemoryViewer";
 import {
   canResendConfirmation,
   canStartAuthRequest,
@@ -707,7 +708,16 @@ function App() {
           </p>
         )}
 
-        {openActivity ? (
+        {openActivity === "memory" && selectedProfile ? (
+          <SeniorMemoryViewer
+            profile={selectedProfile}
+            onBack={() => setOpenActivity(null)}
+            onHome={() => {
+              setOpenActivity(null);
+              setSelectedProfile(null);
+            }}
+          />
+        ) : openActivity ? (
           <section
             className="senior-content"
             aria-label="Activity availability"

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_theme.dart';
+import 'elderly_memory_screen.dart';
 import 'memory_decks_screen.dart';
 
 const _supabaseUrl = String.fromEnvironment('SUPABASE_URL');
@@ -654,6 +655,18 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
     final selectedProfile = _selectedProfile;
 
     if (_openActivityKey != null) {
+      if (_openActivityKey == 'memory' && selectedProfile != null) {
+        return ElderlyMemoryScreen(
+          selectedProfile: selectedProfile,
+          onBack: () => setState(() => _openActivityKey = null),
+          onHome: () => setState(() {
+            _openActivityKey = null;
+            _selectedProfileId = null;
+            _selectedProfile = null;
+          }),
+        );
+      }
+
       final activity = _seniorActivities.firstWhere(
         (item) => item.key == _openActivityKey,
         orElse: () => _seniorActivities.first,

@@ -51,7 +51,7 @@ Update this document continuously. Do not mark a feature implemented until its t
 
 ## Release evidence
 
-- Android APK version/hash: Debug APK `android_app/build/app/outputs/flutter-apk/app-debug.apk`; package `com.kincare.kincare_android`; app label `KinCare`; SHA-256 `A7AED4B9F01A71FB50E028700F1AD0B73583E23A1C3640736B6A69D3DD991925`; built with live SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY dart-defines.
+- Android APK version/hash: Debug APK `android_app/build/app/outputs/flutter-apk/app-debug.apk`; package `com.kincare.kincare_android`; app label `KinCare`; SHA-256 `37FE67E81B4F6103769FBD3430BD68F47C019E1698988C92394D30484D14DF45`; built with live SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY dart-defines. Includes both caregiver deck management and accessible elderly Memory Card viewing experience.
 - PWA deployed URL/build: Production build passed (`tsc -b && vite build`), 14/14 unit tests passing.
 - Supabase migration commit:
 - Git commit/tag:
