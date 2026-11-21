@@ -30,6 +30,7 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
   Map<String, dynamic>? _activeDeck;
   List<Map<String, dynamic>> _cards = [];
   int _cardIndex = 0;
+  bool _storyRevealed = false;
 
   bool _loadingDecks = true;
   bool _loadingCards = false;
@@ -136,6 +137,7 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
       _activeDeck = deck;
       _loadingCards = true;
       _cardIndex = 0;
+      _storyRevealed = false;
       _cards = [];
     });
 
@@ -205,7 +207,10 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
   void _nextCard() {
     _stopAudio();
     if (_cardIndex < _cards.length - 1) {
-      setState(() => _cardIndex++);
+      setState(() {
+        _cardIndex++;
+        _storyRevealed = false;
+      });
       // Preload next photo
       if (_cardIndex + 1 < _cards.length) {
         _resolveSignedUrl(
@@ -220,7 +225,10 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
   void _previousCard() {
     _stopAudio();
     if (_cardIndex > 0) {
-      setState(() => _cardIndex--);
+      setState(() {
+        _cardIndex--;
+        _storyRevealed = false;
+      });
     }
   }
 
@@ -606,6 +614,7 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
     final hasQuestionAudio =
         questionAudioId != null && questionAudioId.isNotEmpty;
     final hasAnswerAudio = answerAudioId != null && answerAudioId.isNotEmpty;
+    final hasStoryContent = answerContext.isNotEmpty || hasAnswerAudio;
 
     return Container(
       decoration: BoxDecoration(
@@ -711,8 +720,29 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
 
           const SizedBox(height: KinCareSpace.x5),
 
-          // Caregiver Answer Context / Story
-          if (answerContext.isNotEmpty) ...[
+          // Story is only added to the widget tree after an explicit reveal.
+          if (hasStoryContent && !_storyRevealed) ...[
+            SizedBox(
+              height: KinCareSenior.controlHeight,
+              child: FilledButton.icon(
+                onPressed: () => setState(() => _storyRevealed = true),
+                icon: const Icon(Icons.auto_stories_outlined, size: 28),
+                label: const Text(
+                  'Reveal Memory Story',
+                  style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
+                ),
+                style: FilledButton.styleFrom(
+                  backgroundColor: KinCareColors.amber,
+                  foregroundColor: KinCareColors.charcoal,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(KinCareRadii.lg),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: KinCareSpace.x5),
+          ],
+          if (answerContext.isNotEmpty && _storyRevealed) ...[
             Container(
               padding: const EdgeInsets.all(KinCareSpace.x5),
               decoration: BoxDecoration(
@@ -760,7 +790,7 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
           ],
 
           // Spoken Answer Audio Button
-          if (hasAnswerAudio) ...[
+          if (hasAnswerAudio && _storyRevealed) ...[
             const SizedBox(height: KinCareSpace.x4),
             _buildAudioButton(
               role: 'answer',

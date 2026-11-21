@@ -1808,6 +1808,24 @@
   margin-bottom: var(--space-6);
 }
 
+.senior-reveal-btn {
+  min-height: 72px;
+  width: 100%;
+  margin: 0 0 var(--space-6);
+  padding: 0 var(--space-5);
+  border: 2px solid var(--forest);
+  border-radius: var(--r-lg);
+  background: var(--amber);
+  color: var(--forest);
+  font-size: 22px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.senior-reveal-btn:hover {
+  background: #e4b66e;
+}
+
 .senior-story-text {
   margin: 0 0 var(--space-4);
   font-size: 22px;

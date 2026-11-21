@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabase";
 import { getSignedUrl } from "../lib/mediaUpload";
+import { MemoryStoryReveal } from "./MemoryStoryReveal";
 import type { ElderlyProfile } from "./MemoryDecks";
 
 type SeniorMemoryViewerProps = {
@@ -405,29 +406,15 @@ export function SeniorMemoryViewer({
                 )}
               </div>
 
-              {/* Answer Context / Story & Audio */}
-              {cards[cardIndex].answer_context && (
-                <div className="senior-story-box">
-                  <span className="senior-section-tag">Memory Story</span>
-                  <p className="senior-story-text">
-                    {cards[cardIndex].answer_context}
-                  </p>
-
-                  {cards[cardIndex].answer_audio_url && (
-                    <button
-                      type="button"
-                      className={`senior-audio-btn ${
-                        playingRole === "answer" ? "senior-audio-active" : ""
-                      }`}
-                      onClick={() =>
-                        playAudio(cards[cardIndex].answer_audio_url, "answer")
-                      }
-                    >
-                      {playingRole === "answer" ? "⏹ Stop Story" : "🔊 Listen to Story"}
-                    </button>
-                  )}
-                </div>
-              )}
+              <MemoryStoryReveal
+                key={cards[cardIndex].id}
+                story={cards[cardIndex].answer_context}
+                answerAudioUrl={cards[cardIndex].answer_audio_url}
+                isPlaying={playingRole === "answer"}
+                onToggleAudio={() =>
+                  playAudio(cards[cardIndex].answer_audio_url, "answer")
+                }
+              />
 
               {/* Navigation controls */}
               <div className="senior-nav-controls">
