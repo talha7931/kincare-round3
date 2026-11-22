@@ -20,13 +20,15 @@ class CaregiverNavigationActions extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (MediaQuery.sizeOf(context).width < 700) {
+    if (MediaQuery.sizeOf(context).width < 980) {
       return PopupMenuButton<String>(
         tooltip: 'Open navigation menu',
         icon: const Icon(Icons.menu),
         onSelected: (action) {
           switch (action) {
             case 'profiles':
+            case 'overview':
+            case 'reports':
             case 'memory':
             case 'activity':
               onSectionSelected(action);
@@ -38,10 +40,12 @@ class CaregiverNavigationActions extends StatelessWidget {
         },
         itemBuilder: (context) => [
           if (!seniorMode) ...[
+            const PopupMenuItem(value: 'overview', child: Text('Dashboard')),
             const PopupMenuItem(value: 'profiles', child: Text('Profiles')),
             const PopupMenuItem(value: 'memory', child: Text('Memory Decks')),
             const PopupMenuItem(
                 value: 'activity', child: Text('Activity history')),
+            const PopupMenuItem(value: 'reports', child: Text('Reports')),
           ],
           PopupMenuItem(
             value: 'mode',
@@ -54,9 +58,11 @@ class CaregiverNavigationActions extends StatelessWidget {
 
     return Row(mainAxisSize: MainAxisSize.min, children: [
       if (!seniorMode) ...[
+        _sectionButton('overview', 'Dashboard'),
         _sectionButton('profiles', 'Profiles'),
         _sectionButton('memory', 'Memory Decks'),
         _sectionButton('activity', 'Activity history'),
+        _sectionButton('reports', 'Reports'),
       ],
       TextButton(
         onPressed: onToggleMode,

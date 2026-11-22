@@ -73,15 +73,23 @@ For recorded audio, store the file in private Supabase Storage and link it throu
 
 ## Reporting contract
 
-The report query/model must include the selected elderly profile, reporting period, sessions, activity types, statuses, recorded responses and caregiver observations. It must also expose pending-local-sync status where relevant, because the cloud may not yet contain all local data.
+The report query/model must include the selected elderly profile, reporting period, sessions, activity types, statuses and recorded responses. Each client may include caregiver observations supplied while preparing that report. It must expose pending-local-sync status where relevant; the current report screens read cloud rows and must label their coverage as synced cloud activity.
+
+Reports use only rows visible to the signed-in caregiver through existing RLS. They do not use service-role credentials or client-side ownership checks as a substitute for RLS. No reporting table or schema extension is required for the current cloud-backed summary.
 
 ## Dashboard aggregation definitions
 
-- Total sessions: count of sessions in the selected profile/date range, excluding locally pending records only when the dashboard is explicitly cloud-only; otherwise label local vs synced totals.
+- Reporting period: inclusive UTC calendar dates, filtered against `ACTIVITY_SESSIONS.started_at`. Both clients display that the period uses UTC.
+- Total elderly profiles: count of profiles returned by the caregiver-scoped profile query.
+- Total sessions: count of caregiver-visible cloud sessions in the selected profile/date range. Label the coverage as synced cloud activity; do not imply that locally pending records are included.
 - Sessions by activity: count grouped by activity type.
-- Participation days: distinct local calendar dates with at least one session, using a documented timezone rule.
-- Completion rate: completed sessions divided by all sessions with a known final status; do not treat in-progress/unknown as failed.
+- Daily engagement: distinct UTC dates with at least one session in the selected period; weekly engagement groups those UTC dates by ISO week (Monday through Sunday).
+- Session frequency: total sessions divided by the number of UTC calendar days in the selected period; include the denominator in the report.
+- Completion rate: completed sessions divided by completed plus abandoned sessions; exclude in-progress sessions because their final outcome is unknown.
+- Duration: there is no duration column. Derive elapsed time only when both `started_at` and `completed_at` exist; otherwise report duration as unavailable. This is elapsed session time, not active engagement time.
 - Correctness: display only for structured activities where `is_correct` is meaningful. Never score open-ended Memory Deck reminiscence.
+- Response summaries: render fields by stable `response_payload.activity_type`; do not treat Memory Deck payloads as sorting responses. Keep report language factual and non-clinical.
+- Every PDF includes the caregiver-visible profile display name, caregiver display name when available, UTC reporting period, generation date, metric definitions/coverage, applicable activity history, optional caregiver observations and the non-clinical disclaimer.
 
 ## Sync contract
 

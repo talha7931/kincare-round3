@@ -6,6 +6,8 @@ import { MemoryDecks } from "./components/MemoryDecks";
 import { SeniorMemoryViewer } from "./components/SeniorMemoryViewer";
 import { CognitiveGames } from "./components/CognitiveGames";
 import { CaregiverActivityHistory } from "./components/CaregiverActivityHistory";
+import { CaregiverDashboard } from "./components/CaregiverDashboard";
+import { CaregiverReport } from "./components/CaregiverReport";
 import {
   cognitiveGameActivityKeys,
   isCognitiveGameActivityKey,
@@ -921,102 +923,19 @@ function App() {
         )}
 
         {caregiverSection === "overview" && (
-          <section className="overview-layout">
-            <div className="identity-surface">
-              <span className="identity-initial" aria-hidden="true">
-                {profileInitial(selectedProfile?.display_name ?? "")}
-              </span>
-              <div>
-                <strong
-                  className={`identity-name ${selectedProfile ? "" : "identity-name--empty"}`}
-                >
-                  {selectedProfile?.display_name ?? "None selected"}
-                </strong>
-                <p className="identity-language">
-                  {selectedProfile
-                    ? `Preferred language: ${languageLabel(selectedProfile.preferred_language)}`
-                    : "Choose a person to see their language and activities."}
-                </p>
-              </div>
-              <button
-                type="button"
-                className="btn btn-primary identity-action"
-                onClick={() => setCaregiverSection("profiles")}
-              >
-                Choose profile
-              </button>
+          <section className="overview-layout overview-layout--reporting">
+            <CaregiverDashboard
+              profiles={profiles}
+              caregiverName={caregiverName}
+              onOpenProfileReport={(profileId) => {
+                setSelectedProfile(profiles.find((profile) => profile.id === profileId) ?? null);
+                setCaregiverSection("reports");
+              }}
+            />
+            {/* Profile selection remains available alongside reporting. */}
+            <div className="reporting-overview-profile-link">
+              <button type="button" className="btn btn-quiet" onClick={() => setCaregiverSection("profiles")}>Manage elderly profiles</button>
             </div>
-
-            <div className="support-column">
-              <div className="support-row">
-                <span className="support-label">Elderly profiles</span>
-                <span className="support-value">{profiles.length}</span>
-                <button
-                  type="button"
-                  className="btn btn-quiet"
-                  onClick={() => setCaregiverSection("profiles")}
-                >
-                  Manage profiles
-                </button>
-              </div>
-              <div className="support-row">
-                <span className="support-label">Current mode</span>
-                <span className="support-value">Caregiver</span>
-                <button
-                  type="button"
-                  className="btn btn-quiet"
-                  onClick={() => setAppMode("elderly")}
-                >
-                  Open senior view
-                </button>
-              </div>
-              <div className="support-row">
-                <h2>Participation history</h2>
-                <p className="empty-state support-empty">
-                  No activity records are loaded. Participation and reports
-                  appear here after activity sessions are recorded.
-                </p>
-              </div>
-            </div>
-
-            <section className="content-panel people-panel">
-              <div className="panel-heading">
-                <h2>People you support</h2>
-                <button
-                  type="button"
-                  className="btn btn-quiet"
-                  onClick={() => setCaregiverSection("profiles")}
-                >
-                  View all
-                </button>
-              </div>
-              {profiles.length === 0 ? (
-                <p className="empty-state">
-                  No elderly profiles have been added.
-                </p>
-              ) : (
-                <div className="profile-list">
-                  {profiles.map((profile) => (
-                    <button
-                      type="button"
-                      className={`profile-row ${selectedProfile?.id === profile.id ? "selected" : ""}`}
-                      key={profile.id}
-                      onClick={() => setSelectedProfile(profile)}
-                    >
-                      <span className="profile-initial" aria-hidden="true">
-                        {profileInitial(profile.display_name)}
-                      </span>
-                      <span>
-                        <strong>{profile.display_name}</strong>
-                        <span className="profile-language">
-                          {languageLabel(profile.preferred_language)}
-                        </span>
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </section>
           </section>
         )}
 
@@ -1178,13 +1097,11 @@ function App() {
           <CaregiverActivityHistory profiles={profiles} />
         )}
         {caregiverSection === "reports" && (
-          <section className="content-panel feature-placeholder">
-            <h2>Report export is not available yet</h2>
-            <p>
-              This area will export a factual engagement summary, not a clinical
-              assessment.
-            </p>
-          </section>
+          <CaregiverReport
+            profiles={profiles}
+            caregiverName={caregiverName}
+            initialProfileId={selectedProfile?.id}
+          />
         )}
         {caregiverSection === "wellbeing" && (
           <section className="content-panel wellbeing-panel">

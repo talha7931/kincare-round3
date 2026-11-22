@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { supabase } from "../lib/supabase";
+import { formatUtcTimestamp, responseSummary } from "../lib/engagementReporting";
 
 type Profile = { id: string; display_name: string };
 type Session = {
@@ -10,12 +11,12 @@ type Session = {
   completed_at: string | null;
   status: string;
 };
-type ActivityType = { id: string; name: string };
+type ActivityType = { id: string; name: string; stable_key: string };
 type ResponseRow = { session_id: string; response_index: number; response_payload: Record<string, unknown> };
 
 export function CaregiverActivityHistory({ profiles }: { profiles: Profile[] }) {
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [types, setTypes] = useState<Record<string, string>>({});
+  const [types, setTypes] = useState<Record<string, ActivityType>>({});
   const [responses, setResponses] = useState<Record<string, ResponseRow[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -43,7 +44,7 @@ export function CaregiverActivityHistory({ profiles }: { profiles: Profile[] }) 
         const sessionIds = loadedSessions.map((row) => row.id);
         const [typeResult, responseResult] = await Promise.all([
           typeIds.length
-            ? supabase.from("activity_types").select("id, name").in("id", typeIds)
+            ? supabase.from("activity_types").select("id, name, stable_key").in("id", typeIds)
             : Promise.resolve({ data: [], error: null }),
           sessionIds.length
             ? supabase.from("activity_responses").select("session_id, response_index, response_payload").in("session_id", sessionIds).order("response_index")
@@ -51,8 +52,8 @@ export function CaregiverActivityHistory({ profiles }: { profiles: Profile[] }) 
         ]);
         if (typeResult.error) throw typeResult.error;
         if (responseResult.error) throw responseResult.error;
-        const typeMap: Record<string, string> = {};
-        (typeResult.data as ActivityType[] | null)?.forEach((row) => { typeMap[row.id] = row.name; });
+        const typeMap: Record<string, ActivityType> = {};
+        (typeResult.data as ActivityType[] | null)?.forEach((row) => { typeMap[row.id] = row; });
         const grouped: Record<string, ResponseRow[]> = {};
         (responseResult.data as ResponseRow[] | null)?.forEach((row) => {
           (grouped[row.session_id] ??= []).push(row);
@@ -83,15 +84,13 @@ export function CaregiverActivityHistory({ profiles }: { profiles: Profile[] }) 
           : <div className="activity-history-list">
             {sessions.map((session) => (
               <article className="activity-history-card" key={session.id}>
-                <h3>{types[session.activity_type_id] ?? "Activity"}</h3>
+                <h3>{types[session.activity_type_id]?.name ?? "Activity"}</h3>
                 <p><strong>Profile:</strong> {profileNames[session.elderly_profile_id] ?? "Profile"}</p>
-                <p><strong>Started:</strong> {new Date(session.started_at).toLocaleString()}</p>
+                <p><strong>Started:</strong> {formatUtcTimestamp(session.started_at)}</p>
                 <p><strong>Status:</strong> {session.status === "completed" ? "Completed" : session.status === "abandoned" ? "Stopped early" : "In progress"}</p>
                 {(responses[session.id] ?? []).map((response) => {
                   const payload = response.response_payload;
-                  const description = payload.activity_type === "odd_one_out"
-                    ? `Round ${response.response_index + 1}: selected ${String(payload.selected_item_id ?? "item")}`
-                    : `${String(payload.item_id ?? "Object")} placed in ${String(payload.selected_category_id ?? "a group")}`;
+                  const description = responseSummary(types[session.activity_type_id]?.stable_key ?? "", payload);
                   return <p className="activity-response-summary" key={`${session.id}-${response.response_index}`}>{description}</p>;
                 })}
               </article>
