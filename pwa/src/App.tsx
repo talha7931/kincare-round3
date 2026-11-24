@@ -8,6 +8,9 @@ import { CognitiveGames } from "./components/CognitiveGames";
 import { CaregiverActivityHistory } from "./components/CaregiverActivityHistory";
 import { CaregiverDashboard } from "./components/CaregiverDashboard";
 import { CaregiverReport } from "./components/CaregiverReport";
+import { SyncStatusBar } from "./components/SyncStatusBar";
+import { cacheProfiles, clearSyncedCache, readProfiles } from "./lib/offlineDb";
+import { initializeOfflineSync, stopOfflineSync } from "./lib/offlineSync";
 import {
   cognitiveGameActivityKeys,
   isCognitiveGameActivityKey,
@@ -183,7 +186,10 @@ function App() {
   }, [resendCooldownSeconds]);
 
   useEffect(() => {
-    if (user) void loadCaregiverData();
+    if (user) {
+      void loadCaregiverData();
+      void initializeOfflineSync(user.id);
+    }
   }, [user]);
 
   async function ensureCaregiverProfile() {
@@ -218,6 +224,7 @@ function App() {
 
       if (profilesError) throw profilesError;
       setProfiles(data ?? []);
+      await cacheProfiles(user?.id ?? "", data ?? []).catch(() => undefined);
     } finally {
       setProfilesLoading(false);
     }
@@ -229,11 +236,13 @@ function App() {
       await ensureCaregiverProfile();
       await loadProfiles();
     } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "Unable to load account data",
-      );
+      const cached = user ? await readProfiles(user.id).catch(() => []) : [];
+      if (cached.length) {
+        setProfiles(cached);
+        setError("Offline mode: using profiles saved on this device. They refresh when you reconnect.");
+      } else {
+        setError(caught instanceof Error ? caught.message : "Unable to load account data");
+      }
     }
   }
 
@@ -384,6 +393,12 @@ function App() {
 
   async function signOut() {
     setError("");
+    if (user) {
+      stopOfflineSync(user.id);
+      await clearSyncedCache(user.id).catch((cacheError) => {
+        setError(cacheError instanceof Error ? cacheError.message : "Saved offline data could not be cleared.");
+      });
+    }
     const { error: signOutError } = await supabase.auth.signOut();
     if (signOutError) setError(signOutError.message);
   }
@@ -712,6 +727,8 @@ function App() {
           </button>
         </header>
 
+        <SyncStatusBar caregiverId={user.id} />
+
         {error && (
           <p className="senior-message senior-error" role="alert">
             {error}
@@ -915,6 +932,8 @@ function App() {
             </button>
           </div>
         </header>
+
+        <SyncStatusBar caregiverId={user.id} />
 
         {error && (
           <p className="error" role="alert">

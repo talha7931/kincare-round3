@@ -1,0 +1,13 @@
+{
+  "name": "KinCare",
+  "short_name": "KinCare",
+  "description": "Caregiver support and familiar activities for older adults.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f8f5",
+  "theme_color": "#183d35",
+  "icons": [
+    { "src": "/kincare-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

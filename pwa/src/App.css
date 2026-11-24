@@ -2024,6 +2024,11 @@
   min-width: 0;
 }
 
+.sync-status { display: flex; align-items: center; justify-content: center; gap: 0.65rem; flex-wrap: wrap; min-height: 42px; padding: 0.4rem 1rem; color: #173d34; background: #eaf1ed; font-size: 0.92rem; }
+.sync-status--offline { color: #4f5d57; background: #eef0ed; }
+.sync-status--failed { color: #862b24; background: #fbefee; }
+.sync-status--syncing { color: #173d34; background: #e7efeb; }
+
 .reporting-heading,
 .reporting-period,
 .reporting-controls,

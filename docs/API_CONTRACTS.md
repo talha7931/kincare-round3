@@ -94,8 +94,11 @@ Reports use only rows visible to the signed-in caregiver through existing RLS. T
 ## Sync contract
 
 - Client-generated UUIDs for offline-created records.
-- Upsert/idempotent cloud writes keyed by stable IDs.
+- Retrying a session with an existing stable ID must verify the existing elderly profile and device IDs before accepting it as already persisted or updating its final status.
+- Responses are append-only inserts keyed by their stable IDs. On retry, an existing matching response is accepted as persisted; an ID collision with another session/caregiver is an error. Clients must not update response rows.
 - Upload binary media before inserting/updating metadata rows that reference the uploaded file.
 - Session/response records are append-only for the MVP.
 - Store sync state locally: `pending`, `syncing`, `synced`, `failed`.
 - Never mark synced until the server confirms the write.
+- Before sync, verify the current authenticated caregiver, caregiver-visible elderly profile, and caregiver-owned enrolled device; reject missing or revoked devices without dropping the local queued data.
+- Local activity histories may include pending/failed rows; Phase 4 dashboard and report totals remain scoped to cloud-synced rows and must say so.

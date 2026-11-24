@@ -3,6 +3,7 @@ import { supabase } from "../lib/supabase";
 import { getSignedUrl } from "../lib/mediaUpload";
 import { MemoryStoryReveal } from "./MemoryStoryReveal";
 import type { ElderlyProfile } from "./MemoryDecks";
+import { cacheDeck, cacheDeckMetadata, cacheMedia, readCards, readDecks, readMedia } from "../lib/offlineDb";
 
 type SeniorMemoryViewerProps = {
   profile: ElderlyProfile;
@@ -57,6 +58,12 @@ export function SeniorMemoryViewer({
     null
   );
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const mediaUrlsRef = useRef<string[]>([]);
+
+  const clearMediaUrls = useCallback(() => {
+    for (const url of mediaUrlsRef.current) URL.revokeObjectURL(url);
+    mediaUrlsRef.current = [];
+  }, []);
 
   const stopAudio = useCallback(() => {
     if (audioRef.current) {
@@ -94,8 +101,9 @@ export function SeniorMemoryViewer({
   useEffect(() => {
     return () => {
       stopAudio();
+      clearMediaUrls();
     };
-  }, [stopAudio]);
+  }, [clearMediaUrls, stopAudio]);
 
   // Load decks for profile
   useEffect(() => {
@@ -115,10 +123,11 @@ export function SeniorMemoryViewer({
         const deckIds = deckList.map((d) => d.id);
 
         if (deckIds.length > 0) {
-          const { data: cardRows } = await supabase
+          const { data: cardRows, error: cardError } = await supabase
             .from("memory_cards")
             .select("deck_id")
             .in("deck_id", deckIds);
+          if (cardError) throw new Error(cardError.message);
 
           const countMap: Record<string, number> = {};
           (cardRows ?? []).forEach((r: { deck_id: string }) => {
@@ -130,9 +139,17 @@ export function SeniorMemoryViewer({
           });
         }
 
+        const { data: authData } = await supabase.auth.getSession();
+        const owner = authData.session?.user.id;
+        if (owner) await Promise.all(deckList.map((deck) => cacheDeckMetadata(owner, profile.id, deck as unknown as Record<string, unknown>).catch(() => undefined)));
+
         setDecks(deckList);
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to load memory decks");
+        const { data } = await supabase.auth.getSession();
+        const cached = await readDecks(data.session?.user.id ?? "", profile.id);
+        const deckList = await Promise.all(cached.map(async (deck) => ({ ...deck, card_count: (await readCards(data.session?.user.id ?? "", String(deck.id))).length } as MemoryDeck)));
+        setDecks(deckList);
+        setError(deckList.length ? null : e instanceof Error ? e.message : "Failed to load memory decks");
       } finally {
         setLoadingDecks(false);
       }
@@ -143,6 +160,7 @@ export function SeniorMemoryViewer({
   // Open a specific deck and resolve card media URLs
   const openDeck = async (deck: MemoryDeck) => {
     stopAudio();
+    clearMediaUrls();
     setActiveDeck(deck);
     setLoadingCards(true);
     setCardIndex(0);
@@ -169,14 +187,25 @@ export function SeniorMemoryViewer({
 
       let assetsMap: Record<string, string> = {};
       if (assetIds.length > 0) {
-        const { data: assetRows } = await supabase
+        const { data: assetRows, error: assetError } = await supabase
           .from("media_assets")
-          .select("id, storage_path")
+          .select("id, storage_path, storage_bucket, mime_type")
           .in("id", assetIds);
+        if (assetError) throw new Error(assetError.message);
 
         (assetRows ?? []).forEach((a: { id: string; storage_path: string }) => {
           assetsMap[a.id] = a.storage_path;
         });
+      }
+
+      const { data: authData } = await supabase.auth.getSession();
+      const owner = authData.session?.user.id;
+      if (!owner) throw new Error("Sign in again to save this deck for offline use.");
+      const assetDetails = new Map<string, { path: string; bucket: string; mime: string | null }>();
+      if (assetIds.length) {
+        const { data: rows, error: assetError } = await supabase.from("media_assets").select("id, storage_path, storage_bucket, mime_type").in("id", assetIds);
+        if (assetError) throw new Error(assetError.message);
+        for (const row of rows ?? []) assetDetails.set(row.id, { path: row.storage_path, bucket: row.storage_bucket ?? "kincare-media", mime: row.mime_type });
       }
 
       // Resolve signed URLs
@@ -190,16 +219,26 @@ export function SeniorMemoryViewer({
             ? assetsMap[card.answer_audio_asset_id]
             : null;
 
+          const resolveAsset = async (assetId: string | null | undefined, path: string | null | undefined) => {
+            if (!assetId || !path) return undefined;
+            const detail = assetDetails.get(assetId);
+            if (!detail) return undefined;
+            try {
+              const { data: blob, error } = await supabase.storage.from(detail.bucket).download(detail.path);
+              if (error) throw error;
+              await cacheMedia(owner, assetId, blob, detail.path, detail.mime);
+              const localUrl = URL.createObjectURL(blob);
+              mediaUrlsRef.current.push(localUrl);
+              return localUrl;
+            } catch {
+              return getSignedUrl(path).catch(() => undefined);
+            }
+          };
+
           const [photoUrl, qAudioUrl, aAudioUrl] = await Promise.all([
-            photoPath
-              ? getSignedUrl(photoPath).catch(() => undefined)
-              : Promise.resolve(undefined),
-            qAudioPath
-              ? getSignedUrl(qAudioPath).catch(() => undefined)
-              : Promise.resolve(undefined),
-            aAudioPath
-              ? getSignedUrl(aAudioPath).catch(() => undefined)
-              : Promise.resolve(undefined),
+            resolveAsset(card.photo_asset_id, photoPath),
+            resolveAsset(card.question_audio_asset_id, qAudioPath),
+            resolveAsset(card.answer_audio_asset_id, aAudioPath),
           ]);
 
           return {
@@ -211,9 +250,22 @@ export function SeniorMemoryViewer({
         })
       );
 
+      await cacheDeck(owner, profile.id, deck as unknown as Record<string, unknown>, rawCards as unknown as Record<string, unknown>[]).catch(() => undefined);
       setCards(resolved);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load cards");
+      const { data } = await supabase.auth.getSession();
+      const cached = await readCards(data.session?.user.id ?? "", deck.id);
+      const resolved = await Promise.all(cached.map(async (card) => {
+        const resolveLocal = async (assetId: unknown) => {
+          if (typeof assetId !== "string") return undefined;
+          const blob = await readMedia(data.session?.user.id ?? "", assetId);
+          if (!blob) return undefined;
+          const url = URL.createObjectURL(blob); mediaUrlsRef.current.push(url); return url;
+        };
+        return { ...card, photo_url: await resolveLocal(card.photo_asset_id), question_audio_url: await resolveLocal(card.question_audio_asset_id), answer_audio_url: await resolveLocal(card.answer_audio_asset_id) } as MemoryCard;
+      }));
+      setCards(resolved);
+      setError(resolved.length ? null : e instanceof Error ? e.message : "This deck has not been saved for offline use yet.");
     } finally {
       setLoadingCards(false);
     }

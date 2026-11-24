@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_theme.dart';
+import 'offline_store.dart';
 
 /// Elderly-facing Memory Deck and Memory Card viewer.
 /// Implements the accessible reminiscence experience specified in Phase 2.
@@ -25,6 +27,8 @@ class ElderlyMemoryScreen extends StatefulWidget {
 
 class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
   final _client = Supabase.instance.client;
+  final _store = OfflineStore.instance;
+  String get _caregiverId => _client.auth.currentUser?.id ?? '';
 
   List<Map<String, dynamic>> _decks = [];
   Map<String, dynamic>? _activeDeck;
@@ -66,19 +70,40 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
     if (assetId == null || assetId.isEmpty) return null;
     if (_urlCache.containsKey(assetId)) return _urlCache[assetId];
 
+    final localPath = await _store.mediaPath(_caregiverId, assetId);
+    if (localPath != null) {
+      _urlCache[assetId] = localPath;
+      return localPath;
+    }
+
     try {
       final row = await _client
           .from('media_assets')
-          .select('storage_path')
+          .select('storage_path, storage_bucket, mime_type')
           .eq('id', assetId)
           .maybeSingle();
 
       if (row == null || row['storage_path'] == null) return null;
       final storagePath = row['storage_path'].toString();
 
-      final signedUrl = await _client.storage
-          .from('kincare-media')
-          .createSignedUrl(storagePath, 3600);
+      final bucket = row['storage_bucket']?.toString() ?? 'kincare-media';
+      final signedUrl =
+          await _client.storage.from(bucket).createSignedUrl(storagePath, 3600);
+
+      try {
+        final extension = storagePath.split('.').last;
+        final cachedPath = await _store.cacheMediaIfNeeded(
+          _caregiverId,
+          assetId,
+          () => _client.storage.from(bucket).download(storagePath),
+          row['mime_type']?.toString(),
+          extension: extension,
+        );
+        _urlCache[assetId] = cachedPath;
+        return cachedPath;
+      } catch (_) {
+        // Signed playback remains available if the local media copy fails.
+      }
 
       _urlCache[assetId] = signedUrl;
       return signedUrl;
@@ -117,6 +142,7 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
             .select('id')
             .eq('deck_id', deck['id']);
         deck['_card_count'] = (countResult as List).length;
+        await _store.cacheDeckMetadata(_caregiverId, profileId, deck);
       }
 
       setState(() {
@@ -124,8 +150,15 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
         _loadingDecks = false;
       });
     } catch (e) {
+      final cachedDecks = await _store.readDecks(_caregiverId, profileId);
+      for (final deck in cachedDecks) {
+        deck['_card_count'] =
+            (await _store.readCards(_caregiverId, deck['id'].toString()))
+                .length;
+      }
       setState(() {
-        _error = 'Unable to load memory decks: $e';
+        _decks = cachedDecks;
+        _error = cachedDecks.isEmpty ? 'Unable to load memory decks: $e' : null;
         _loadingDecks = false;
       });
     }
@@ -150,6 +183,12 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
           .order('display_order');
 
       final loadedCards = List<Map<String, dynamic>>.from(cardRows);
+      await _store.cacheDeck(
+          _caregiverId,
+          deck['elderly_profile_id']?.toString() ??
+              widget.selectedProfile['id'].toString(),
+          deck,
+          loadedCards);
 
       // Pre-fetch signed URL for the first photo
       if (loadedCards.isNotEmpty) {
@@ -158,16 +197,93 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
           await _resolveSignedUrl(firstPhotoId);
         }
       }
+      unawaited(_cacheDeckMedia(loadedCards));
 
       setState(() {
         _cards = loadedCards;
         _loadingCards = false;
       });
     } catch (e) {
+      final cachedCards =
+          await _store.readCards(_caregiverId, deck['id'].toString());
       setState(() {
-        _error = 'Unable to load cards: $e';
+        _cards = cachedCards;
+        _error = cachedCards.isEmpty ? 'Unable to load cards: $e' : null;
         _loadingCards = false;
       });
+    }
+  }
+
+  Future<void> _cacheDeckMedia(List<Map<String, dynamic>> cards) async {
+    final assetIds = <String>{};
+    for (final card in cards) {
+      for (final key in [
+        'photo_asset_id',
+        'question_audio_asset_id',
+        'answer_audio_asset_id'
+      ]) {
+        final value = card[key]?.toString();
+        if (value != null && value.isNotEmpty) assetIds.add(value);
+      }
+    }
+    if (assetIds.isEmpty) return;
+    var failed = false;
+    try {
+      final rows = await _client
+          .from('media_assets')
+          .select('id, storage_bucket, storage_path, mime_type')
+          .inFilter('id', assetIds.toList());
+      final assetsById = {
+        for (final row in List<Map<String, dynamic>>.from(rows))
+          row['id'].toString(): row,
+      };
+      for (final assetId in assetIds) {
+        final row = assetsById[assetId];
+        if (row == null) {
+          failed = true;
+          await _store.setCacheItem(_caregiverId, 'media', assetId, 'failed',
+              'Media metadata is unavailable.');
+          continue;
+        }
+        try {
+          final bucket = row['storage_bucket']?.toString() ?? 'kincare-media';
+          final path = row['storage_path']?.toString();
+          if (path == null || path.isEmpty) {
+            throw StateError('Media path is unavailable.');
+          }
+          await _store.cacheMediaIfNeeded(
+              _caregiverId,
+              assetId,
+              () => _client.storage.from(bucket).download(path),
+              row['mime_type']?.toString(),
+              extension: path.split('.').last);
+          if (await _store.mediaPath(_caregiverId, assetId) == null) {
+            throw StateError('Cached media could not be verified.');
+          }
+          await _store.setCacheItem(_caregiverId, 'media', assetId, 'ready');
+        } catch (error) {
+          failed = true;
+          await _store.setCacheItem(
+              _caregiverId, 'media', assetId, 'failed', error.toString());
+        }
+      }
+    } catch (error) {
+      failed = true;
+      for (final assetId in assetIds) {
+        await _store.setCacheItem(
+            _caregiverId, 'media', assetId, 'failed', error.toString());
+      }
+    }
+    final ready =
+        !failed && await _store.allMediaCached(_caregiverId, assetIds.toList());
+    final deckId = _activeDeck?['id']?.toString();
+    if (deckId != null) {
+      await _store.setCacheItem(
+          _caregiverId,
+          'deck',
+          deckId,
+          ready ? 'ready' : 'partial',
+          ready ? null : 'Some cards or media are unavailable offline.');
     }
   }
 
@@ -185,8 +301,8 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
     }
 
     await _stopAudio();
-    final url = await _resolveSignedUrl(assetId);
-    if (url == null || url.isEmpty) {
+    final path = await _resolveSignedUrl(assetId);
+    if (path == null || path.isEmpty) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -201,7 +317,8 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
     }
 
     setState(() => _currentlyPlayingRole = role);
-    await _audioPlayer.play(UrlSource(url));
+    await _audioPlayer.play(
+        File(path).existsSync() ? DeviceFileSource(path) : UrlSource(path));
   }
 
   void _nextCard() {
@@ -213,8 +330,7 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
       });
       // Preload next photo
       if (_cardIndex + 1 < _cards.length) {
-        _resolveSignedUrl(
-            _cards[_cardIndex + 1]['photo_asset_id']?.toString());
+        _resolveSignedUrl(_cards[_cardIndex + 1]['photo_asset_id']?.toString());
       }
     } else {
       // Completed deck
@@ -445,6 +561,7 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
   Widget _buildDeckCard(Map<String, dynamic> deck) {
     final cardCount = deck['_card_count'] as int? ?? 0;
     final lang = languageLabel(deck['language_code']);
+    final offlineStatus = deck['_offline_status']?.toString();
 
     return Material(
       color: KinCareColors.white,
@@ -491,7 +608,9 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
                       ),
                     ),
                     const SizedBox(height: 6),
-                    Row(
+                    Wrap(
+                      spacing: KinCareSpace.x2,
+                      runSpacing: KinCareSpace.x1,
                       children: [
                         Container(
                           padding: const EdgeInsets.symmetric(
@@ -500,7 +619,8 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
                           ),
                           decoration: BoxDecoration(
                             color: KinCareColors.paleSage,
-                            borderRadius: BorderRadius.circular(KinCareRadii.xs),
+                            borderRadius:
+                                BorderRadius.circular(KinCareRadii.xs),
                           ),
                           child: Text(
                             '$cardCount ${cardCount == 1 ? 'photo' : 'photos'}',
@@ -511,7 +631,6 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
                             ),
                           ),
                         ),
-                        const SizedBox(width: KinCareSpace.x2),
                         Container(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 10,
@@ -519,7 +638,8 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
                           ),
                           decoration: BoxDecoration(
                             color: KinCareColors.cloud,
-                            borderRadius: BorderRadius.circular(KinCareRadii.xs),
+                            borderRadius:
+                                BorderRadius.circular(KinCareRadii.xs),
                           ),
                           child: Text(
                             lang,
@@ -530,6 +650,24 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
                             ),
                           ),
                         ),
+                        if (offlineStatus != null && offlineStatus != 'ready')
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 3),
+                            decoration: BoxDecoration(
+                              color: KinCareColors.paleSage,
+                              borderRadius:
+                                  BorderRadius.circular(KinCareRadii.xs),
+                            ),
+                            child: Text(
+                              offlineStatus == 'partial' ||
+                                      offlineStatus == 'failed'
+                                  ? 'Some media unavailable offline'
+                                  : 'Offline availability unknown',
+                              style: const TextStyle(
+                                  fontSize: 14, color: KinCareColors.danger),
+                            ),
+                          ),
                       ],
                     ),
                   ],
@@ -936,23 +1074,37 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
 
         return ClipRRect(
           borderRadius: BorderRadius.circular(KinCareRadii.xl),
-          child: Image.network(
-            url,
-            fit: BoxFit.cover,
-            height: 320,
-            width: double.infinity,
-            errorBuilder: (_, __, ___) => Container(
-              height: 260,
-              color: KinCareColors.paleSage,
-              child: const Center(
-                child: Icon(
-                  Icons.broken_image_outlined,
-                  size: 48,
-                  color: KinCareColors.danger,
+          child: url.startsWith('http')
+              ? Image.network(
+                  url,
+                  fit: BoxFit.cover,
+                  height: 320,
+                  width: double.infinity,
+                  errorBuilder: (_, __, ___) => Container(
+                    height: 260,
+                    color: KinCareColors.paleSage,
+                    child: const Center(
+                      child: Icon(
+                        Icons.broken_image_outlined,
+                        size: 48,
+                        color: KinCareColors.danger,
+                      ),
+                    ),
+                  ),
+                )
+              : Image.file(
+                  File(url),
+                  fit: BoxFit.cover,
+                  height: 320,
+                  width: double.infinity,
+                  errorBuilder: (_, __, ___) => Container(
+                    height: 260,
+                    color: KinCareColors.paleSage,
+                    child: const Center(
+                        child: Icon(Icons.broken_image_outlined,
+                            size: 48, color: KinCareColors.danger)),
+                  ),
                 ),
-              ),
-            ),
-          ),
         );
       },
     );
@@ -986,8 +1138,7 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
           ),
         ),
         style: FilledButton.styleFrom(
-          backgroundColor:
-              isPlaying ? KinCareColors.amber : KinCareColors.sage,
+          backgroundColor: isPlaying ? KinCareColors.amber : KinCareColors.sage,
           foregroundColor:
               isPlaying ? KinCareColors.charcoal : KinCareColors.white,
           shape: RoundedRectangleBorder(
@@ -998,4 +1149,3 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
     );
   }
 }
-

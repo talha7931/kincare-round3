@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_theme.dart';
@@ -10,6 +11,10 @@ import 'cognitive_game_rules.dart';
 import 'elderly_memory_screen.dart';
 import 'memory_decks_screen.dart';
 import 'caregiver_navigation_actions.dart';
+import 'offline_store.dart';
+import 'offline_sync.dart';
+import 'offline_sync_status.dart';
+import 'offline_cache_preparation.dart';
 import 'caregiver_dashboard_screen.dart';
 import 'caregiver_report_screen.dart';
 
@@ -521,6 +526,12 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
   String? _error;
   bool _loading = true;
   bool _profileMutationLoading = false;
+  bool _signOutLoading = false;
+  CachePreparationSnapshot _cacheProgress =
+      const CachePreparationSnapshot(0, 0, 0, false);
+  String? _cacheError;
+  late final OfflineCachePreparation _cachePreparation;
+  StreamSubscription<List<ConnectivityResult>>? _cacheConnectivitySubscription;
   bool _seniorMode = false;
   String _caregiverSection = 'overview';
 
@@ -530,14 +541,56 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
   @override
   void initState() {
     super.initState();
+    _cachePreparation = OfflineCachePreparation(_client, OfflineStore.instance);
+    _cachePreparation.progress.addListener(_onCacheProgress);
+    _cacheConnectivitySubscription =
+        Connectivity().onConnectivityChanged.listen((results) {
+      if (results.any((result) => result != ConnectivityResult.none) &&
+          !_cacheProgress.running) {
+        unawaited(_prepareOfflineData());
+      }
+    });
+    unawaited(OfflineSyncService(_client).initialize(widget.user.id));
     _loadData();
   }
 
   @override
   void dispose() {
+    _cachePreparation.progress.removeListener(_onCacheProgress);
+    _cachePreparation.progress.dispose();
+    _cacheConnectivitySubscription?.cancel();
     _caregiverNameController.dispose();
     _profileNameController.dispose();
     super.dispose();
+  }
+
+  void _onCacheProgress() {
+    if (mounted)
+      setState(() => _cacheProgress = _cachePreparation.progress.value);
+  }
+
+  Future<void> _prepareOfflineData() async {
+    if (_client.auth.currentUser?.id != widget.user.id) return;
+    try {
+      final connection = await Connectivity().checkConnectivity();
+      if (connection.every((result) => result == ConnectivityResult.none)) {
+        _cachePreparation.waitForConnection();
+        return;
+      }
+    } catch (_) {
+      // The request below remains the authoritative Supabase reachability check.
+    }
+    final retrying =
+        _cacheProgress.status == CachePreparationStatus.waitingForConnection ||
+            _cacheProgress.failed > 0;
+    setState(() => _cacheError = null);
+    try {
+      await _cachePreparation.prepare(widget.user.id, retrying: retrying);
+    } catch (error) {
+      if (mounted)
+        setState(
+            () => _cacheError = 'Offline preparation needs a retry: $error');
+    }
   }
 
   Future<void> _loadData() async {
@@ -567,8 +620,27 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
       }
 
       await _loadProfiles();
+      unawaited(_prepareOfflineData());
     } catch (error) {
-      setState(() => _error = error.toString());
+      final cached = await OfflineStore.instance.readProfiles(widget.user.id);
+      final cachedCaregiver =
+          await OfflineStore.instance.readCaregiver(widget.user.id);
+      if (mounted) {
+        setState(() {
+          _caregiverNameController.text =
+              cachedCaregiver?['display_name']?.toString() ??
+                  widget.user.userMetadata?['display_name']?.toString() ??
+                  '';
+          _profiles = cached;
+          _selectedProfile = cached.cast<Map<String, dynamic>?>().firstWhere(
+                (profile) => profile?['id'] == _selectedProfileId,
+                orElse: () => null,
+              );
+          _error = cached.isEmpty
+              ? 'Connect to the internet to load profiles for the first time.'
+              : 'Offline mode: using profiles saved on this device. They refresh when you reconnect.';
+        });
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -590,6 +662,9 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
             );
       }
     });
+    await OfflineStore.instance
+        .cacheProfiles(widget.user.id, _profiles)
+        .catchError((_) {});
   }
 
   Future<void> _saveCaregiverName() async {
@@ -697,7 +772,43 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
   }
 
   Future<void> _signOut() async {
-    await _client.auth.signOut();
+    if (_signOutLoading) return;
+    final ownerId = _client.auth.currentUser?.id;
+    if (ownerId == null) return;
+    final counts = await OfflineStore.instance.outboxCounts(ownerId);
+    final pending = (counts['pending'] ?? 0) + (counts['failed'] ?? 0);
+    if (!mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Sign out of KinCare?'),
+        content: Text(pending > 0
+            ? '$pending activity record${pending == 1 ? '' : 's'} still need to sync. They will stay saved for this caregiver and will not be shared with another account. Continue signing out?'
+            : 'You can sign back in to access this caregiver account.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Sign out')),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() {
+      _signOutLoading = true;
+      _error = null;
+    });
+    try {
+      OfflineSyncService(_client).stopForSignOut(ownerId);
+      await _client.auth.signOut();
+      await OfflineStore.instance.clearSyncedCache(ownerId);
+    } catch (error) {
+      if (mounted) setState(() => _error = 'Sign out failed: $error');
+    } finally {
+      if (mounted) setState(() => _signOutLoading = false);
+    }
   }
 
   Widget _buildSeniorMode() {
@@ -1079,379 +1190,471 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
           ),
         ],
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _seniorMode
-              ? _buildSeniorMode()
-              : _caregiverSection == 'overview'
-                  ? CaregiverDashboardScreen(
-                      profiles: _profiles,
-                      caregiverName: _caregiverNameController.text,
-                      onOpenProfileReport: (profileId) => setState(() {
-                        _selectedProfileId = profileId;
-                        _selectedProfile = _profiles.firstWhere(
-                          (profile) => profile['id'].toString() == profileId,
-                        );
-                        _caregiverSection = 'reports';
-                      }),
-                    )
-                  : _caregiverSection == 'reports'
-                      ? CaregiverReportScreen(
-                          profiles: _profiles,
-                          caregiverName: _caregiverNameController.text,
-                          initialProfileId: _selectedProfileId,
-                        )
-                      : _caregiverSection == 'memory'
-                          ? MemoryDecksScreen(
-                              user: widget.user,
-                              selectedProfile: _selectedProfile)
-                          : _caregiverSection == 'activity'
-                              ? CaregiverActivityHistoryScreen(
-                                  profiles: _profiles)
-                              : SingleChildScrollView(
-                                  padding: const EdgeInsets.all(16),
-                                  child: Center(
-                                    child: ConstrainedBox(
-                                      constraints:
-                                          const BoxConstraints(maxWidth: 960),
-                                      child: LayoutBuilder(
-                                        builder: (context, constraints) {
-                                          final stacked =
-                                              constraints.maxWidth < 700;
-                                          final left = Card(
-                                            child: Padding(
-                                              padding: const EdgeInsets.all(16),
-                                              child: Column(
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.stretch,
-                                                children: [
-                                                  Text('Your profile',
-                                                      style: Theme.of(context)
-                                                          .textTheme
-                                                          .titleLarge),
-                                                  const SizedBox(height: 12),
-                                                  TextField(
-                                                      controller:
-                                                          _caregiverNameController,
-                                                      decoration:
-                                                          const InputDecoration(
-                                                              labelText:
-                                                                  'Display name')),
-                                                  const SizedBox(height: 12),
-                                                  FilledButton(
-                                                      onPressed:
-                                                          _profileMutationLoading
-                                                              ? null
-                                                              : _saveCaregiverName,
-                                                      child: const Text(
-                                                          'Save name')),
-                                                  const SizedBox(
-                                                      height: KinCareSpace.x6),
-                                                  const Divider(),
-                                                  const SizedBox(
-                                                      height: KinCareSpace.x6),
-                                                  Text('Add elderly profile',
-                                                      style: Theme.of(context)
-                                                          .textTheme
-                                                          .titleLarge),
-                                                  const SizedBox(height: 12),
-                                                  TextField(
-                                                      controller:
-                                                          _profileNameController,
-                                                      decoration:
-                                                          const InputDecoration(
-                                                              labelText:
-                                                                  'Display name')),
-                                                  const SizedBox(height: 12),
-                                                  DropdownButtonFormField<
-                                                      String>(
-                                                    initialValue:
-                                                        _profileLanguage,
-                                                    decoration:
-                                                        const InputDecoration(
-                                                            labelText:
-                                                                'Preferred language'),
-                                                    items: const [
-                                                      DropdownMenuItem(
-                                                          value: 'en',
-                                                          child:
-                                                              Text('English')),
-                                                      DropdownMenuItem(
-                                                          value: 'hi',
-                                                          child: Text('Hindi')),
-                                                      DropdownMenuItem(
-                                                          value: 'mr',
-                                                          child:
-                                                              Text('Marathi')),
-                                                    ],
-                                                    onChanged: (value) =>
-                                                        setState(() =>
-                                                            _profileLanguage =
-                                                                value ?? 'en'),
-                                                  ),
-                                                  const SizedBox(height: 12),
-                                                  FilledButton(
-                                                      onPressed:
-                                                          _profileMutationLoading
-                                                              ? null
-                                                              : _createProfile,
-                                                      child: Text(
-                                                          _profileMutationLoading
-                                                              ? 'Saving...'
-                                                              : 'Add profile')),
-                                                ],
-                                              ),
-                                            ),
-                                          );
-
-                                          final right = Card(
-                                            child: Padding(
-                                              padding: const EdgeInsets.all(16),
-                                              child: Column(
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.stretch,
-                                                children: [
-                                                  Text('Elderly profiles',
-                                                      style: Theme.of(context)
-                                                          .textTheme
-                                                          .titleLarge),
-                                                  const SizedBox(height: 12),
-                                                  if (_profiles.isEmpty)
-                                                    const Text(
-                                                      'No elderly profiles have been added.',
-                                                      style: TextStyle(
-                                                          color: KinCareColors
-                                                              .textMuted),
-                                                    ),
-                                                  for (final profile
-                                                      in _profiles)
-                                                    Container(
-                                                      margin:
-                                                          const EdgeInsets.only(
-                                                              bottom: 2),
-                                                      decoration: BoxDecoration(
-                                                        color:
-                                                            _selectedProfileId ==
-                                                                    profile[
-                                                                        'id']
-                                                                ? KinCareColors
-                                                                    .paleSage
-                                                                : Colors
-                                                                    .transparent,
-                                                        borderRadius:
-                                                            BorderRadius
-                                                                .circular(
-                                                                    KinCareRadii
-                                                                        .md),
-                                                      ),
-                                                      child: InkWell(
-                                                        borderRadius:
-                                                            BorderRadius
-                                                                .circular(
-                                                                    KinCareRadii
-                                                                        .md),
-                                                        onTap: () =>
-                                                            setState(() {
-                                                          _selectedProfileId =
-                                                              profile['id'];
-                                                          _selectedProfile = Map<
-                                                                  String,
-                                                                  dynamic>.from(
-                                                              profile);
-                                                        }),
-                                                        child: Padding(
-                                                          padding:
-                                                              const EdgeInsets
-                                                                  .symmetric(
-                                                            horizontal:
-                                                                KinCareSpace.x2,
-                                                            vertical:
-                                                                KinCareSpace.x3,
-                                                          ),
-                                                          child: Row(
-                                                            children: [
-                                                              Container(
-                                                                width: 44,
-                                                                height: 44,
-                                                                alignment:
-                                                                    Alignment
-                                                                        .center,
-                                                                decoration:
-                                                                    BoxDecoration(
-                                                                  color: _selectedProfileId ==
-                                                                          profile[
-                                                                              'id']
-                                                                      ? KinCareColors
-                                                                          .white
-                                                                      : KinCareColors
-                                                                          .paleSage,
-                                                                  shape: BoxShape
-                                                                      .circle,
-                                                                ),
+      body: Column(
+        children: [
+          const OfflineSyncStatusBar(),
+          if (_cacheProgress.status != CachePreparationStatus.notStarted ||
+              _cacheError != null)
+            Material(
+              color: KinCareColors.paleSage,
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: Row(children: [
+                  Expanded(
+                      child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                        Text(
+                          _cacheError ??
+                              switch (_cacheProgress.status) {
+                                CachePreparationStatus.notStarted => '',
+                                CachePreparationStatus.preparing =>
+                                  '${_cacheProgress.stage}: ${_cacheProgress.completed}/${_cacheProgress.total} complete, ${_cacheProgress.pending} pending',
+                                CachePreparationStatus.retrying =>
+                                  'Retrying ${_cacheProgress.stage.toLowerCase()}: ${_cacheProgress.completed}/${_cacheProgress.total} complete',
+                                CachePreparationStatus.ready =>
+                                  'Offline content ready for this caregiver.',
+                                CachePreparationStatus.partiallyReady =>
+                                  'Some content needs retry (${_cacheProgress.failed} items incomplete).',
+                                CachePreparationStatus.failed =>
+                                  'Offline preparation failed. Retry when connected.',
+                                CachePreparationStatus.waitingForConnection =>
+                                  'Waiting for a network connection to prepare offline content.',
+                              },
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                        if (_cacheProgress.running)
+                          LinearProgressIndicator(
+                              value: _cacheProgress.progress),
+                      ])),
+                  if (!_cacheProgress.running &&
+                      (_cacheProgress.failed > 0 ||
+                          _cacheError != null ||
+                          _cacheProgress.status ==
+                              CachePreparationStatus.waitingForConnection))
+                    TextButton(
+                      onPressed: _prepareOfflineData,
+                      child: const Text('Retry'),
+                    ),
+                ]),
+              ),
+            ),
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _seniorMode
+                    ? _buildSeniorMode()
+                    : _caregiverSection == 'overview'
+                        ? CaregiverDashboardScreen(
+                            profiles: _profiles,
+                            caregiverName: _caregiverNameController.text,
+                            onOpenProfileReport: (profileId) => setState(() {
+                              _selectedProfileId = profileId;
+                              _selectedProfile = _profiles.firstWhere(
+                                (profile) =>
+                                    profile['id'].toString() == profileId,
+                              );
+                              _caregiverSection = 'reports';
+                            }),
+                          )
+                        : _caregiverSection == 'reports'
+                            ? CaregiverReportScreen(
+                                profiles: _profiles,
+                                caregiverName: _caregiverNameController.text,
+                                initialProfileId: _selectedProfileId,
+                              )
+                            : _caregiverSection == 'memory'
+                                ? MemoryDecksScreen(
+                                    user: widget.user,
+                                    selectedProfile: _selectedProfile)
+                                : _caregiverSection == 'activity'
+                                    ? CaregiverActivityHistoryScreen(
+                                        profiles: _profiles)
+                                    : SingleChildScrollView(
+                                        padding: const EdgeInsets.all(16),
+                                        child: Center(
+                                          child: ConstrainedBox(
+                                            constraints: const BoxConstraints(
+                                                maxWidth: 960),
+                                            child: LayoutBuilder(
+                                              builder: (context, constraints) {
+                                                final stacked =
+                                                    constraints.maxWidth < 700;
+                                                final left = Card(
+                                                  child: Padding(
+                                                    padding:
+                                                        const EdgeInsets.all(
+                                                            16),
+                                                    child: Column(
+                                                      crossAxisAlignment:
+                                                          CrossAxisAlignment
+                                                              .stretch,
+                                                      children: [
+                                                        Text('Your profile',
+                                                            style: Theme.of(
+                                                                    context)
+                                                                .textTheme
+                                                                .titleLarge),
+                                                        const SizedBox(
+                                                            height: 12),
+                                                        TextField(
+                                                            controller:
+                                                                _caregiverNameController,
+                                                            decoration:
+                                                                const InputDecoration(
+                                                                    labelText:
+                                                                        'Display name')),
+                                                        const SizedBox(
+                                                            height: 12),
+                                                        FilledButton(
+                                                            onPressed:
+                                                                _profileMutationLoading
+                                                                    ? null
+                                                                    : _saveCaregiverName,
+                                                            child: const Text(
+                                                                'Save name')),
+                                                        const SizedBox(
+                                                            height: KinCareSpace
+                                                                .x6),
+                                                        const Divider(),
+                                                        const SizedBox(
+                                                            height: KinCareSpace
+                                                                .x6),
+                                                        Text(
+                                                            'Add elderly profile',
+                                                            style: Theme.of(
+                                                                    context)
+                                                                .textTheme
+                                                                .titleLarge),
+                                                        const SizedBox(
+                                                            height: 12),
+                                                        TextField(
+                                                            controller:
+                                                                _profileNameController,
+                                                            decoration:
+                                                                const InputDecoration(
+                                                                    labelText:
+                                                                        'Display name')),
+                                                        const SizedBox(
+                                                            height: 12),
+                                                        DropdownButtonFormField<
+                                                            String>(
+                                                          initialValue:
+                                                              _profileLanguage,
+                                                          decoration:
+                                                              const InputDecoration(
+                                                                  labelText:
+                                                                      'Preferred language'),
+                                                          items: const [
+                                                            DropdownMenuItem(
+                                                                value: 'en',
                                                                 child: Text(
-                                                                  profileInitial(
+                                                                    'English')),
+                                                            DropdownMenuItem(
+                                                                value: 'hi',
+                                                                child: Text(
+                                                                    'Hindi')),
+                                                            DropdownMenuItem(
+                                                                value: 'mr',
+                                                                child: Text(
+                                                                    'Marathi')),
+                                                          ],
+                                                          onChanged: (value) =>
+                                                              setState(() =>
+                                                                  _profileLanguage =
+                                                                      value ??
+                                                                          'en'),
+                                                        ),
+                                                        const SizedBox(
+                                                            height: 12),
+                                                        FilledButton(
+                                                            onPressed:
+                                                                _profileMutationLoading
+                                                                    ? null
+                                                                    : _createProfile,
+                                                            child: Text(
+                                                                _profileMutationLoading
+                                                                    ? 'Saving...'
+                                                                    : 'Add profile')),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                );
+
+                                                final right = Card(
+                                                  child: Padding(
+                                                    padding:
+                                                        const EdgeInsets.all(
+                                                            16),
+                                                    child: Column(
+                                                      crossAxisAlignment:
+                                                          CrossAxisAlignment
+                                                              .stretch,
+                                                      children: [
+                                                        Text('Elderly profiles',
+                                                            style: Theme.of(
+                                                                    context)
+                                                                .textTheme
+                                                                .titleLarge),
+                                                        const SizedBox(
+                                                            height: 12),
+                                                        if (_profiles.isEmpty)
+                                                          const Text(
+                                                            'No elderly profiles have been added.',
+                                                            style: TextStyle(
+                                                                color: KinCareColors
+                                                                    .textMuted),
+                                                          ),
+                                                        for (final profile
+                                                            in _profiles)
+                                                          Container(
+                                                            margin:
+                                                                const EdgeInsets
+                                                                    .only(
+                                                                    bottom: 2),
+                                                            decoration:
+                                                                BoxDecoration(
+                                                              color: _selectedProfileId ==
+                                                                      profile[
+                                                                          'id']
+                                                                  ? KinCareColors
+                                                                      .paleSage
+                                                                  : Colors
+                                                                      .transparent,
+                                                              borderRadius:
+                                                                  BorderRadius
+                                                                      .circular(
+                                                                          KinCareRadii
+                                                                              .md),
+                                                            ),
+                                                            child: InkWell(
+                                                              borderRadius:
+                                                                  BorderRadius
+                                                                      .circular(
+                                                                          KinCareRadii
+                                                                              .md),
+                                                              onTap: () =>
+                                                                  setState(() {
+                                                                _selectedProfileId =
                                                                     profile[
-                                                                        'display_name'],
-                                                                  ),
-                                                                  style:
-                                                                      const TextStyle(
-                                                                    fontSize:
-                                                                        17,
-                                                                    fontWeight:
-                                                                        FontWeight
-                                                                            .w700,
-                                                                    color: KinCareColors
-                                                                        .forest,
-                                                                  ),
-                                                                ),
-                                                              ),
-                                                              const SizedBox(
-                                                                  width:
+                                                                        'id'];
+                                                                _selectedProfile = Map<
+                                                                        String,
+                                                                        dynamic>.from(
+                                                                    profile);
+                                                              }),
+                                                              child: Padding(
+                                                                padding:
+                                                                    const EdgeInsets
+                                                                        .symmetric(
+                                                                  horizontal:
                                                                       KinCareSpace
-                                                                          .x3),
-                                                              Expanded(
-                                                                child: Column(
-                                                                  crossAxisAlignment:
-                                                                      CrossAxisAlignment
-                                                                          .start,
+                                                                          .x2,
+                                                                  vertical:
+                                                                      KinCareSpace
+                                                                          .x3,
+                                                                ),
+                                                                child: Row(
                                                                   children: [
-                                                                    Text(
-                                                                      profile['display_name']
-                                                                          .toString(),
-                                                                      style:
-                                                                          const TextStyle(
-                                                                        fontSize:
-                                                                            16,
-                                                                        fontWeight:
-                                                                            FontWeight.w600,
-                                                                        color: KinCareColors
-                                                                            .forest,
+                                                                    Container(
+                                                                      width: 44,
+                                                                      height:
+                                                                          44,
+                                                                      alignment:
+                                                                          Alignment
+                                                                              .center,
+                                                                      decoration:
+                                                                          BoxDecoration(
+                                                                        color: _selectedProfileId ==
+                                                                                profile['id']
+                                                                            ? KinCareColors.white
+                                                                            : KinCareColors.paleSage,
+                                                                        shape: BoxShape
+                                                                            .circle,
+                                                                      ),
+                                                                      child:
+                                                                          Text(
+                                                                        profileInitial(
+                                                                          profile[
+                                                                              'display_name'],
+                                                                        ),
+                                                                        style:
+                                                                            const TextStyle(
+                                                                          fontSize:
+                                                                              17,
+                                                                          fontWeight:
+                                                                              FontWeight.w700,
+                                                                          color:
+                                                                              KinCareColors.forest,
+                                                                        ),
                                                                       ),
                                                                     ),
                                                                     const SizedBox(
-                                                                        height:
-                                                                            2),
-                                                                    Text(
-                                                                      languageLabel(
-                                                                        profile[
-                                                                            'preferred_language'],
+                                                                        width: KinCareSpace
+                                                                            .x3),
+                                                                    Expanded(
+                                                                      child:
+                                                                          Column(
+                                                                        crossAxisAlignment:
+                                                                            CrossAxisAlignment.start,
+                                                                        children: [
+                                                                          Text(
+                                                                            profile['display_name'].toString(),
+                                                                            style:
+                                                                                const TextStyle(
+                                                                              fontSize: 16,
+                                                                              fontWeight: FontWeight.w600,
+                                                                              color: KinCareColors.forest,
+                                                                            ),
+                                                                          ),
+                                                                          const SizedBox(
+                                                                              height: 2),
+                                                                          Text(
+                                                                            languageLabel(
+                                                                              profile['preferred_language'],
+                                                                            ),
+                                                                            style:
+                                                                                const TextStyle(
+                                                                              fontSize: 13,
+                                                                              color: KinCareColors.textMuted,
+                                                                            ),
+                                                                          ),
+                                                                        ],
                                                                       ),
-                                                                      style:
-                                                                          const TextStyle(
-                                                                        fontSize:
-                                                                            13,
-                                                                        color: KinCareColors
-                                                                            .textMuted,
+                                                                    ),
+                                                                    IconButton(
+                                                                      tooltip:
+                                                                          'Delete profile',
+                                                                      icon:
+                                                                          const Icon(
+                                                                        Icons
+                                                                            .delete_outline,
                                                                       ),
+                                                                      onPressed: _profileMutationLoading
+                                                                          ? null
+                                                                          : () =>
+                                                                              _deleteProfile(profile),
                                                                     ),
                                                                   ],
                                                                 ),
                                                               ),
-                                                              IconButton(
-                                                                tooltip:
-                                                                    'Delete profile',
-                                                                icon:
-                                                                    const Icon(
-                                                                  Icons
-                                                                      .delete_outline,
-                                                                ),
-                                                                onPressed: _profileMutationLoading
-                                                                    ? null
-                                                                    : () => _deleteProfile(
-                                                                        profile),
-                                                              ),
-                                                            ],
+                                                            ),
                                                           ),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  if (_selectedProfile !=
-                                                      null) ...[
-                                                    const Divider(),
-                                                    Text(
-                                                        'Edit selected profile',
-                                                        style: Theme.of(context)
-                                                            .textTheme
-                                                            .titleMedium),
-                                                    const SizedBox(height: 12),
-                                                    TextField(
-                                                      controller:
-                                                          TextEditingController
-                                                              .fromValue(
-                                                        TextEditingValue(
-                                                            text: _selectedProfile![
-                                                                    'display_name']
-                                                                .toString()),
-                                                      ),
-                                                      onChanged: (value) =>
-                                                          _selectedProfile![
-                                                                  'display_name'] =
-                                                              value,
-                                                      decoration:
-                                                          const InputDecoration(
-                                                              labelText:
-                                                                  'Display name'),
-                                                    ),
-                                                    const SizedBox(height: 12),
-                                                    DropdownButtonFormField<
-                                                        String>(
-                                                      initialValue:
-                                                          _selectedProfile![
-                                                              'preferred_language'],
-                                                      decoration:
-                                                          const InputDecoration(
-                                                              labelText:
-                                                                  'Preferred language'),
-                                                      items: const [
-                                                        DropdownMenuItem(
-                                                            value: 'en',
-                                                            child: Text(
-                                                                'English')),
-                                                        DropdownMenuItem(
-                                                            value: 'hi',
-                                                            child:
-                                                                Text('Hindi')),
-                                                        DropdownMenuItem(
-                                                            value: 'mr',
-                                                            child: Text(
-                                                                'Marathi')),
+                                                        if (_selectedProfile !=
+                                                            null) ...[
+                                                          const Divider(),
+                                                          Text(
+                                                              'Edit selected profile',
+                                                              style: Theme.of(
+                                                                      context)
+                                                                  .textTheme
+                                                                  .titleMedium),
+                                                          const SizedBox(
+                                                              height: 12),
+                                                          TextField(
+                                                            controller:
+                                                                TextEditingController
+                                                                    .fromValue(
+                                                              TextEditingValue(
+                                                                  text: _selectedProfile![
+                                                                          'display_name']
+                                                                      .toString()),
+                                                            ),
+                                                            onChanged: (value) =>
+                                                                _selectedProfile![
+                                                                        'display_name'] =
+                                                                    value,
+                                                            decoration:
+                                                                const InputDecoration(
+                                                                    labelText:
+                                                                        'Display name'),
+                                                          ),
+                                                          const SizedBox(
+                                                              height: 12),
+                                                          DropdownButtonFormField<
+                                                              String>(
+                                                            initialValue:
+                                                                _selectedProfile![
+                                                                    'preferred_language'],
+                                                            decoration:
+                                                                const InputDecoration(
+                                                                    labelText:
+                                                                        'Preferred language'),
+                                                            items: const [
+                                                              DropdownMenuItem(
+                                                                  value: 'en',
+                                                                  child: Text(
+                                                                      'English')),
+                                                              DropdownMenuItem(
+                                                                  value: 'hi',
+                                                                  child: Text(
+                                                                      'Hindi')),
+                                                              DropdownMenuItem(
+                                                                  value: 'mr',
+                                                                  child: Text(
+                                                                      'Marathi')),
+                                                            ],
+                                                            onChanged: (value) =>
+                                                                setState(() =>
+                                                                    _selectedProfile![
+                                                                            'preferred_language'] =
+                                                                        value ??
+                                                                            'en'),
+                                                          ),
+                                                          const SizedBox(
+                                                              height: 12),
+                                                          FilledButton(
+                                                              onPressed:
+                                                                  _profileMutationLoading
+                                                                      ? null
+                                                                      : _updateProfile,
+                                                              child: Text(
+                                                                  _profileMutationLoading
+                                                                      ? 'Saving...'
+                                                                      : 'Save changes')),
+                                                        ],
                                                       ],
-                                                      onChanged: (value) =>
-                                                          setState(() =>
-                                                              _selectedProfile![
-                                                                      'preferred_language'] =
-                                                                  value ??
-                                                                      'en'),
                                                     ),
-                                                    const SizedBox(height: 12),
-                                                    FilledButton(
-                                                        onPressed:
-                                                            _profileMutationLoading
-                                                                ? null
-                                                                : _updateProfile,
-                                                        child: Text(
-                                                            _profileMutationLoading
-                                                                ? 'Saving...'
-                                                                : 'Save changes')),
-                                                  ],
-                                                ],
-                                              ),
-                                            ),
-                                          );
+                                                  ),
+                                                );
 
-                                          if (_error != null) {
-                                            return Column(children: [
-                                              _Notice(
-                                                  tone: _NoticeTone.error,
-                                                  text: _error!),
-                                              const SizedBox(
-                                                  height: KinCareSpace.x4),
-                                              if (stacked) ...[
-                                                left,
-                                                const SizedBox(height: 12),
-                                                right
-                                              ] else
-                                                Row(
+                                                if (_error != null) {
+                                                  return Column(children: [
+                                                    _Notice(
+                                                        tone: _NoticeTone.error,
+                                                        text: _error!),
+                                                    const SizedBox(
+                                                        height:
+                                                            KinCareSpace.x4),
+                                                    if (stacked) ...[
+                                                      left,
+                                                      const SizedBox(
+                                                          height: 12),
+                                                      right
+                                                    ] else
+                                                      Row(
+                                                          crossAxisAlignment:
+                                                              CrossAxisAlignment
+                                                                  .start,
+                                                          children: [
+                                                            SizedBox(
+                                                                width: 300,
+                                                                child: left),
+                                                            const SizedBox(
+                                                                width: 16),
+                                                            Expanded(
+                                                                child: right)
+                                                          ])
+                                                  ]);
+                                                }
+                                                if (stacked)
+                                                  return Column(children: [
+                                                    left,
+                                                    const SizedBox(height: 12),
+                                                    right
+                                                  ]);
+                                                return Row(
                                                     crossAxisAlignment:
                                                         CrossAxisAlignment
                                                             .start,
@@ -1461,29 +1664,15 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
                                                           child: left),
                                                       const SizedBox(width: 16),
                                                       Expanded(child: right)
-                                                    ])
-                                            ]);
-                                          }
-                                          if (stacked)
-                                            return Column(children: [
-                                              left,
-                                              const SizedBox(height: 12),
-                                              right
-                                            ]);
-                                          return Row(
-                                              crossAxisAlignment:
-                                                  CrossAxisAlignment.start,
-                                              children: [
-                                                SizedBox(
-                                                    width: 300, child: left),
-                                                const SizedBox(width: 16),
-                                                Expanded(child: right)
-                                              ]);
-                                        },
+                                                    ]);
+                                              },
+                                            ),
+                                          ),
+                                        ),
                                       ),
-                                    ),
-                                  ),
-                                ),
+          ),
+        ],
+      ),
     );
   }
 }

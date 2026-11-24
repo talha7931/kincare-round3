@@ -1,14 +1,19 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 
 import 'app_theme.dart';
 import 'cognitive_game_rules.dart';
+import 'offline_store.dart';
+import 'offline_sync.dart';
 
 class CognitiveGamesScreen extends StatefulWidget {
   final Map<String, dynamic> selectedProfile;
@@ -32,6 +37,7 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
   final _client = Supabase.instance.client;
   final _tts = FlutterTts();
   final _uuid = const Uuid();
+  final _store = OfflineStore.instance;
   late Future<Map<String, dynamic>> _contentFuture;
   String? _sessionId;
   String? _error;
@@ -48,8 +54,8 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
   bool get _isSorting => widget.gameKey == everydayObjectSortingActivityKey;
   String get _activityKey => widget.gameKey;
   String get _title => _isSorting ? 'Everyday Object Sorting' : 'Odd One Out';
-  String get _languageCode =>
-      supportedSpeechLanguage(widget.selectedProfile['preferred_language']?.toString());
+  String get _languageCode => supportedSpeechLanguage(
+      widget.selectedProfile['preferred_language']?.toString());
   String get _language => speechLocale(_languageCode);
 
   String _spoken(Object? translations, {String fallback = ''}) => spokenText(
@@ -57,6 +63,12 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
         _languageCode,
         fallback: fallback,
       );
+
+  bool _isTransportFailure(Object error) =>
+      error is SocketException ||
+      error is TimeoutException ||
+      RegExp(r'network|connection|socket|timeout|failed to fetch', caseSensitive: false)
+          .hasMatch(error.toString());
 
   @override
   void initState() {
@@ -82,47 +94,102 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
       await _tts.speak(text);
     } catch (_) {
       if (mounted) {
-        setState(() => _error = 'Audio is unavailable. Please read the instruction shown on screen.');
+        setState(() => _error =
+            'Audio is unavailable. Please read the instruction shown on screen.');
       }
     }
   }
 
   Future<void> _startSession() async {
-    setState(() { _busy = true; _error = null; });
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
     try {
       final user = _client.auth.currentUser;
-      if (user == null) throw StateError('Sign in again before starting an activity.');
+      if (user == null)
+        throw StateError('Sign in again before starting an activity.');
+      final localProfiles = await _store.readProfiles(user.id);
+      if (localProfiles.isNotEmpty &&
+          !localProfiles.any((profile) =>
+              profile['id'].toString() ==
+              widget.selectedProfile['id'].toString())) {
+        throw StateError(
+            'The selected profile is not in this caregiver’s saved profile list.');
+      }
       final preferences = await SharedPreferences.getInstance();
       var deviceUuid = preferences.getString('kincare.device_uuid');
       if (deviceUuid == null || deviceUuid.isEmpty) {
         deviceUuid = _uuid.v4();
         await preferences.setString('kincare.device_uuid', deviceUuid);
       }
-      final device = await _client
-          .from('enrolled_devices')
-          .upsert({
-            'caregiver_id': user.id,
-            'device_uuid': deviceUuid,
-            'device_name': 'KinCare Android device',
-            'last_seen_at': DateTime.now().toUtc().toIso8601String(),
-          }, onConflict: 'caregiver_id,device_uuid')
-          .select('id')
-          .single();
-      final activity = await _client
-          .from('activity_types')
-          .select('id')
-          .eq('stable_key', _activityKey)
-          .single();
+      String? deviceId;
+      String? activityTypeId;
+      final connectivity = await Connectivity().checkConnectivity();
+      final online =
+          connectivity.any((result) => result != ConnectivityResult.none);
+      if (!online &&
+          !localProfiles.any((profile) =>
+              profile['id'].toString() ==
+              widget.selectedProfile['id'].toString())) {
+        throw StateError(
+            'This profile has not been saved on this device for offline use.');
+      }
+      if (online) {
+        try {
+          final device = await _client
+              .from('enrolled_devices')
+              .upsert({
+                'caregiver_id': user.id,
+                'device_uuid': deviceUuid,
+                'device_name': 'KinCare Android device',
+                'last_seen_at': DateTime.now().toUtc().toIso8601String(),
+              }, onConflict: 'caregiver_id,device_uuid')
+              .select('id, revoked_at')
+              .single();
+          if (device['revoked_at'] != null)
+            throw StateError('This device has been revoked.');
+          deviceId = device['id'].toString();
+          await _store.cacheDevice(user.id, deviceUuid, deviceId, null);
+          try {
+            final activity = await _client
+                .from('activity_types')
+                .select('id')
+                .eq('stable_key', _activityKey)
+                .single();
+            activityTypeId = activity['id'].toString();
+          } catch (error) {
+            if (!_isTransportFailure(error)) rethrow;
+          }
+        } catch (error) {
+          final cachedDevice = await _store.readDevice(user.id, deviceUuid);
+          if (!_isTransportFailure(error) || cachedDevice == null || cachedDevice['revoked_at'] != null) rethrow;
+          deviceId = cachedDevice['device_id']?.toString();
+        }
+      } else {
+        final cachedDevice = await _store.readDevice(user.id, deviceUuid);
+        if (cachedDevice == null || cachedDevice['revoked_at'] != null) {
+          throw StateError(
+              'Connect this device to KinCare once before using activities offline.');
+        }
+        deviceId = cachedDevice['device_id']?.toString();
+      }
       final sessionId = _uuid.v4();
-      await _client.from('activity_sessions').insert({
-        'id': sessionId,
-        'elderly_profile_id': widget.selectedProfile['id'],
-        'activity_type_id': activity['id'],
-        'device_id': device['id'],
-        'status': 'in_progress',
-      });
+      await _store.createSession(
+        id: sessionId,
+        caregiverId: user.id,
+        profileId: widget.selectedProfile['id'].toString(),
+        activityKey: _activityKey,
+        activityTypeId: activityTypeId,
+        deviceId: deviceId,
+        startedAt: DateTime.now().toUtc().toIso8601String(),
+      );
       if (!mounted) return;
-      setState(() { _sessionId = sessionId; _stage = 'playing'; });
+      setState(() {
+        _sessionId = sessionId;
+        _stage = 'playing';
+      });
+      unawaited(OfflineSyncService(_client).initialize(user.id));
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
     } finally {
@@ -131,18 +198,12 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
   }
 
   Future<void> _saveResponses(List<Map<String, dynamic>> responses) async {
-    final ids = responses.map((row) => row['id'].toString()).toList();
-    final existing = await _client.from('activity_responses').select('id').inFilter('id', ids);
-    final existingIds = (existing as List).map((row) => row['id'].toString()).toSet();
-    final missing = responses.where((row) => !existingIds.contains(row['id'])).toList();
-    if (missing.isEmpty) return;
-    try {
-      await _client.from('activity_responses').insert(missing);
-    } catch (error) {
-      final confirmed = await _client.from('activity_responses').select('id').inFilter('id', ids);
-      final confirmedIds = (confirmed as List).map((row) => row['id'].toString()).toSet();
-      if (ids.any((id) => !confirmedIds.contains(id))) rethrow;
-    }
+    final userId = _client.auth.currentUser?.id;
+    if (userId == null)
+      throw StateError(
+          'Your saved caregiver account is not available on this device.');
+    await _store.saveResponses(_sessionId!, userId, responses);
+    unawaited(OfflineSyncService(_client).initialize(userId));
   }
 
   Map<String, dynamic> _oddResponse(Map<String, dynamic> round, String itemId) {
@@ -159,29 +220,46 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
         'selected_item_id': itemId,
         'expected_item_id': round['expected_item_id'],
       },
-      'is_correct': oddOneOutIsCorrect(itemId, round['expected_item_id'].toString()),
+      'is_correct':
+          oddOneOutIsCorrect(itemId, round['expected_item_id'].toString()),
       'responded_at': DateTime.now().toUtc().toIso8601String(),
     };
   }
 
   Future<void> _completeSession() async {
     if (_sessionId == null) return;
-    await _client.from('activity_sessions').update({
-      'status': 'completed',
-      'completed_at': DateTime.now().toUtc().toIso8601String(),
-    }).eq('id', _sessionId!);
-    if (mounted) setState(() { _stage = 'complete'; _feedback = 'Thank you for taking part. You can enjoy another activity whenever you like.'; });
+    await _store.finishSession(_sessionId!, 'completed',
+        completedAt: DateTime.now().toUtc().toIso8601String());
+    if (mounted)
+      setState(() {
+        _stage = 'complete';
+        _feedback =
+            'Thank you for taking part. You can enjoy another activity whenever you like.';
+      });
     await _speak(spokenCompletion(_languageCode));
+    final ownerId = _client.auth.currentUser?.id;
+    if (ownerId != null)
+      unawaited(OfflineSyncService(_client).initialize(ownerId));
   }
 
   Future<void> _leaveActivity({required bool home}) async {
     if (_busy) return;
     if (_sessionId != null && _stage == 'playing') {
-      setState(() { _busy = true; _error = null; });
+      setState(() {
+        _busy = true;
+        _error = null;
+      });
       try {
-        await _client.from('activity_sessions').update({'status': 'abandoned'}).eq('id', _sessionId!);
+        await _store.finishSession(_sessionId!, 'abandoned');
+        final ownerId = _client.auth.currentUser?.id;
+        if (ownerId != null)
+          unawaited(OfflineSyncService(_client).initialize(ownerId));
       } catch (error) {
-        if (mounted) setState(() { _error = error.toString(); _busy = false; });
+        if (mounted)
+          setState(() {
+            _error = error.toString();
+            _busy = false;
+          });
         return;
       }
       if (mounted) setState(() => _busy = false);
@@ -195,7 +273,11 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
 
   Future<void> _chooseOdd(Map<String, dynamic> round, String itemId) async {
     if (_busy || _oddResponseSaved) return;
-    setState(() { _busy = true; _error = null; _selectedOddItem = itemId; });
+    setState(() {
+      _busy = true;
+      _error = null;
+      _selectedOddItem = itemId;
+    });
     try {
       await _saveResponses([_oddResponse(round, itemId)]);
       final correct = itemId == round['expected_item_id'];
@@ -207,7 +289,8 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
               : 'That’s okay. ${round['explanation']}';
         });
       }
-      await _speak('${spokenEncouragement(_languageCode, correct: correct)} ${_spoken((round['spoken'] as Map?)?[_languageCode]?['explanation'], fallback: round['explanation'].toString())}');
+      await _speak(
+          '${spokenEncouragement(_languageCode, correct: correct)} ${_spoken((round['spoken'] as Map?)?[_languageCode]?['explanation'], fallback: round['explanation'].toString())}');
       if (_roundIndex == 2) await _completeSession();
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
@@ -218,7 +301,10 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
 
   Future<void> _retryOdd(Map<String, dynamic> round) async {
     if (_selectedOddItem == null || _busy) return;
-    setState(() { _busy = true; _error = null; });
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
     try {
       await _saveResponses([_oddResponse(round, _selectedOddItem!)]);
       if (mounted) {
@@ -230,7 +316,8 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
         });
       }
       final correct = _selectedOddItem == round['expected_item_id'];
-      await _speak('${spokenEncouragement(_languageCode, correct: correct)} ${_spoken((round['spoken'] as Map?)?[_languageCode]?['explanation'], fallback: round['explanation'].toString())}');
+      await _speak(
+          '${spokenEncouragement(_languageCode, correct: correct)} ${_spoken((round['spoken'] as Map?)?[_languageCode]?['explanation'], fallback: round['explanation'].toString())}');
       if (_roundIndex == 2) await _completeSession();
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
@@ -240,15 +327,20 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
   }
 
   Future<void> _finishSorting(Map<String, dynamic> sorting) async {
-    if (_busy || _placements.length != (sorting['items'] as List).length) return;
-    setState(() { _busy = true; _error = null; });
+    if (_busy || _placements.length != (sorting['items'] as List).length)
+      return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
     try {
       final items = (sorting['items'] as List).cast<Map<String, dynamic>>();
       final responses = <Map<String, dynamic>>[];
       for (var index = 0; index < items.length; index++) {
         final item = items[index];
         final selectedCategory = _placements[item['id']];
-        final responseId = _responseIds.putIfAbsent('sort-${item['id']}', _uuid.v4);
+        final responseId =
+            _responseIds.putIfAbsent('sort-${item['id']}', _uuid.v4);
         responses.add({
           'id': responseId,
           'session_id': _sessionId,
@@ -260,7 +352,8 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
             'selected_category_id': selectedCategory,
             'expected_category_id': item['category_id'],
           },
-          'is_correct': sortingIsCorrect(selectedCategory ?? '', item['category_id'].toString()),
+          'is_correct': sortingIsCorrect(
+              selectedCategory ?? '', item['category_id'].toString()),
           'responded_at': DateTime.now().toUtc().toIso8601String(),
         });
       }
@@ -273,12 +366,21 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
     }
   }
 
-  Widget _bigButton(String label, VoidCallback? onPressed, {bool primary = true}) =>
+  Widget _bigButton(String label, VoidCallback? onPressed,
+          {bool primary = true}) =>
       SizedBox(
         height: KinCareSenior.controlHeight,
         child: primary
-            ? FilledButton(onPressed: onPressed, child: Text(label, style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w700)))
-            : OutlinedButton(onPressed: onPressed, child: Text(label, style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w700))),
+            ? FilledButton(
+                onPressed: onPressed,
+                child: Text(label,
+                    style: const TextStyle(
+                        fontSize: 21, fontWeight: FontWeight.w700)))
+            : OutlinedButton(
+                onPressed: onPressed,
+                child: Text(label,
+                    style: const TextStyle(
+                        fontSize: 21, fontWeight: FontWeight.w700))),
       );
 
   @override
@@ -289,46 +391,112 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
             return const Center(child: CircularProgressIndicator());
           }
           final content = snapshot.data!;
-          final rounds = (content['odd_one_out'] as List).cast<Map<String, dynamic>>();
-          final sorting = content['everyday_object_sorting'] as Map<String, dynamic>;
+          final rounds =
+              (content['odd_one_out'] as List).cast<Map<String, dynamic>>();
+          final sorting =
+              content['everyday_object_sorting'] as Map<String, dynamic>;
           final round = rounds[_roundIndex];
           return SingleChildScrollView(
             padding: const EdgeInsets.all(KinCareSpace.x5),
             child: Center(
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 900),
-                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                  Row(children: [
-                    Expanded(child: _bigButton('Activities', _busy ? null : () => _leaveActivity(home: false), primary: false)),
-                    const SizedBox(width: KinCareSpace.x3),
-                    Expanded(child: _bigButton('Home', _busy ? null : () => _leaveActivity(home: true), primary: false)),
-                  ]),
-                  const SizedBox(height: KinCareSpace.x4),
-                  Text(_title, textAlign: TextAlign.center, style: const TextStyle(fontSize: 32, fontWeight: FontWeight.w700, color: KinCareColors.forest)),
-                  if (_error != null) ...[
-                    const SizedBox(height: KinCareSpace.x3),
-                    Container(padding: const EdgeInsets.all(KinCareSpace.x3), decoration: BoxDecoration(color: KinCareColors.dangerWash, border: Border.all(color: KinCareColors.dangerLine), borderRadius: BorderRadius.circular(KinCareRadii.md)), child: Text(_error!, style: const TextStyle(fontSize: 17, color: KinCareColors.danger))),
-                  ],
-                  const SizedBox(height: KinCareSpace.x4),
-                  if (_stage == 'intro') _panel(Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                    Text(_isSorting ? sorting['instruction'].toString() : rounds.first['instruction'].toString(), textAlign: TextAlign.center, style: const TextStyle(fontSize: 25, height: 1.4, fontWeight: FontWeight.w700, color: KinCareColors.forest)),
-                    const SizedBox(height: KinCareSpace.x4),
-                    _bigButton('🔊  Listen to Instructions', () => _speak(_isSorting ? _spoken((sorting['spoken'] as Map?)?[_languageCode]?['instruction'], fallback: sorting['instruction'].toString()) : _spoken((rounds.first['spoken'] as Map?)?[_languageCode]?['instruction'], fallback: rounds.first['instruction'].toString())), primary: false),
-                    const SizedBox(height: KinCareSpace.x3),
-                    _bigButton(_busy ? 'Starting…' : 'Begin Activity', _busy ? null : _startSession),
-                  ])),
-                  if (_stage == 'playing' && !_isSorting) _buildOdd(round),
-                  if (_stage == 'playing' && _isSorting) _buildSorting(sorting),
-                  if (_stage == 'complete') _panel(Column(children: [
-                    const Icon(Icons.spa_outlined, size: 56, color: KinCareColors.sage),
-                    const SizedBox(height: KinCareSpace.x3),
-                    const Text('Activity complete', style: TextStyle(fontSize: 30, fontWeight: FontWeight.w700, color: KinCareColors.forest)),
-                    const SizedBox(height: KinCareSpace.x2),
-                    Text(_feedback ?? 'Thank you for taking part.', textAlign: TextAlign.center, style: const TextStyle(fontSize: 22)),
-                    const SizedBox(height: KinCareSpace.x4),
-                    _bigButton('Back to Activities', widget.onBack),
-                  ])),
-                ]),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(children: [
+                        Expanded(
+                            child: _bigButton(
+                                'Activities',
+                                _busy
+                                    ? null
+                                    : () => _leaveActivity(home: false),
+                                primary: false)),
+                        const SizedBox(width: KinCareSpace.x3),
+                        Expanded(
+                            child: _bigButton('Home',
+                                _busy ? null : () => _leaveActivity(home: true),
+                                primary: false)),
+                      ]),
+                      const SizedBox(height: KinCareSpace.x4),
+                      Text(_title,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                              fontSize: 32,
+                              fontWeight: FontWeight.w700,
+                              color: KinCareColors.forest)),
+                      if (_error != null) ...[
+                        const SizedBox(height: KinCareSpace.x3),
+                        Container(
+                            padding: const EdgeInsets.all(KinCareSpace.x3),
+                            decoration: BoxDecoration(
+                                color: KinCareColors.dangerWash,
+                                border:
+                                    Border.all(color: KinCareColors.dangerLine),
+                                borderRadius:
+                                    BorderRadius.circular(KinCareRadii.md)),
+                            child: Text(_error!,
+                                style: const TextStyle(
+                                    fontSize: 17,
+                                    color: KinCareColors.danger))),
+                      ],
+                      const SizedBox(height: KinCareSpace.x4),
+                      if (_stage == 'intro')
+                        _panel(Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Text(
+                                  _isSorting
+                                      ? sorting['instruction'].toString()
+                                      : rounds.first['instruction'].toString(),
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                      fontSize: 25,
+                                      height: 1.4,
+                                      fontWeight: FontWeight.w700,
+                                      color: KinCareColors.forest)),
+                              const SizedBox(height: KinCareSpace.x4),
+                              _bigButton(
+                                  '🔊  Listen to Instructions',
+                                  () => _speak(_isSorting
+                                      ? _spoken(
+                                          (sorting['spoken']
+                                                  as Map?)?[_languageCode]
+                                              ?['instruction'],
+                                          fallback:
+                                              sorting['instruction'].toString())
+                                      : _spoken(
+                                          (rounds.first['spoken']
+                                                  as Map?)?[_languageCode]
+                                              ?['instruction'],
+                                          fallback: rounds.first['instruction']
+                                              .toString())),
+                                  primary: false),
+                              const SizedBox(height: KinCareSpace.x3),
+                              _bigButton(_busy ? 'Starting…' : 'Begin Activity',
+                                  _busy ? null : _startSession),
+                            ])),
+                      if (_stage == 'playing' && !_isSorting) _buildOdd(round),
+                      if (_stage == 'playing' && _isSorting)
+                        _buildSorting(sorting),
+                      if (_stage == 'complete')
+                        _panel(Column(children: [
+                          const Icon(Icons.spa_outlined,
+                              size: 56, color: KinCareColors.sage),
+                          const SizedBox(height: KinCareSpace.x3),
+                          const Text('Activity complete',
+                              style: TextStyle(
+                                  fontSize: 30,
+                                  fontWeight: FontWeight.w700,
+                                  color: KinCareColors.forest)),
+                          const SizedBox(height: KinCareSpace.x2),
+                          Text(_feedback ?? 'Thank you for taking part.',
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(fontSize: 22)),
+                          const SizedBox(height: KinCareSpace.x4),
+                          _bigButton('Back to Activities', widget.onBack),
+                        ])),
+                    ]),
               ),
             ),
           );
@@ -337,12 +505,29 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
 
   Widget _buildOdd(Map<String, dynamic> round) {
     final items = (round['items'] as List).cast<Map<String, dynamic>>();
-    return _panel(Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text('Round ${_roundIndex + 1} of 3', textAlign: TextAlign.center, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: KinCareColors.sage)),
+    return _panel(
+        Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text('Round ${_roundIndex + 1} of 3',
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.w700,
+              color: KinCareColors.sage)),
       const SizedBox(height: KinCareSpace.x3),
-      Text(round['instruction'].toString(), textAlign: TextAlign.center, style: const TextStyle(fontSize: 25, height: 1.4, fontWeight: FontWeight.w700, color: KinCareColors.forest)),
+      Text(round['instruction'].toString(),
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+              fontSize: 25,
+              height: 1.4,
+              fontWeight: FontWeight.w700,
+              color: KinCareColors.forest)),
       const SizedBox(height: KinCareSpace.x3),
-      _bigButton('🔊  Listen again', () => _speak(_spoken((round['spoken'] as Map?)?[_languageCode]?['instruction'], fallback: round['instruction'].toString())), primary: false),
+      _bigButton(
+          '🔊  Listen again',
+          () => _speak(_spoken(
+              (round['spoken'] as Map?)?[_languageCode]?['instruction'],
+              fallback: round['instruction'].toString())),
+          primary: false),
       const SizedBox(height: KinCareSpace.x4),
       GridView.count(
         crossAxisCount: 2,
@@ -357,47 +542,94 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
             button: true,
             label: 'Choose ${item['label']}',
             child: OutlinedButton(
-              onPressed: _busy || _oddResponseSaved ? null : () {
-                _speak(_spoken(item['spoken'], fallback: item['label'].toString()));
-                _chooseOdd(round, item['id'].toString());
-              },
+              onPressed: _busy || _oddResponseSaved
+                  ? null
+                  : () {
+                      _speak(_spoken(item['spoken'],
+                          fallback: item['label'].toString()));
+                      _chooseOdd(round, item['id'].toString());
+                    },
               style: OutlinedButton.styleFrom(
-                backgroundColor: selected ? KinCareColors.paleSage : KinCareColors.offWhite,
-                side: BorderSide(color: selected ? KinCareColors.sage : KinCareColors.lineStrong, width: 2),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(KinCareRadii.lg)),
+                backgroundColor:
+                    selected ? KinCareColors.paleSage : KinCareColors.offWhite,
+                side: BorderSide(
+                    color: selected
+                        ? KinCareColors.sage
+                        : KinCareColors.lineStrong,
+                    width: 2),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(KinCareRadii.lg)),
               ),
-              child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                Text(item['illustration'].toString(), style: const TextStyle(fontSize: 46)),
-                const SizedBox(height: 5),
-                Text(item['label'].toString(), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: KinCareColors.forest)),
-              ]),
+              child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(item['illustration'].toString(),
+                        style: const TextStyle(fontSize: 46)),
+                    const SizedBox(height: 5),
+                    Text(item['label'].toString(),
+                        style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w700,
+                            color: KinCareColors.forest)),
+                  ]),
             ),
           );
         }).toList(),
       ),
-      if (_feedback != null) ...[const SizedBox(height: KinCareSpace.x4), Text(_feedback!, textAlign: TextAlign.center, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: KinCareColors.forest))],
+      if (_feedback != null) ...[
+        const SizedBox(height: KinCareSpace.x4),
+        Text(_feedback!,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.w700,
+                color: KinCareColors.forest))
+      ],
       if (_error != null && _selectedOddItem != null && !_oddResponseSaved) ...[
         const SizedBox(height: KinCareSpace.x3),
-        _bigButton('Try saving answer again', _busy ? null : () => _retryOdd(round), primary: false),
+        _bigButton(
+            'Try saving answer again', _busy ? null : () => _retryOdd(round),
+            primary: false),
       ],
       if (_oddResponseSaved && _roundIndex < 2) ...[
         const SizedBox(height: KinCareSpace.x4),
-        _bigButton('Next Round', () => setState(() { _roundIndex++; _selectedOddItem = null; _oddResponseSaved = false; _feedback = null; })),
+        _bigButton(
+            'Next Round',
+            () => setState(() {
+                  _roundIndex++;
+                  _selectedOddItem = null;
+                  _oddResponseSaved = false;
+                  _feedback = null;
+                })),
       ],
       if (_oddResponseSaved && _roundIndex == 2 && _stage != 'complete') ...[
         const SizedBox(height: KinCareSpace.x4),
-        _bigButton(_busy ? 'Saving…' : 'Finish Activity', _busy ? null : _completeSession),
+        _bigButton(_busy ? 'Saving…' : 'Finish Activity',
+            _busy ? null : _completeSession),
       ],
     ]));
   }
 
   Widget _buildSorting(Map<String, dynamic> sorting) {
     final items = (sorting['items'] as List).cast<Map<String, dynamic>>();
-    final categories = (sorting['categories'] as List).cast<Map<String, dynamic>>();
-    return _panel(Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text(sorting['instruction'].toString(), textAlign: TextAlign.center, style: const TextStyle(fontSize: 25, height: 1.4, fontWeight: FontWeight.w700, color: KinCareColors.forest)),
+    final categories =
+        (sorting['categories'] as List).cast<Map<String, dynamic>>();
+    return _panel(
+        Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text(sorting['instruction'].toString(),
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+              fontSize: 25,
+              height: 1.4,
+              fontWeight: FontWeight.w700,
+              color: KinCareColors.forest)),
       const SizedBox(height: KinCareSpace.x3),
-      _bigButton('🔊  Listen again', () => _speak(_spoken((sorting['spoken'] as Map?)?[_languageCode]?['instruction'], fallback: sorting['instruction'].toString())), primary: false),
+      _bigButton(
+          '🔊  Listen again',
+          () => _speak(_spoken(
+              (sorting['spoken'] as Map?)?[_languageCode]?['instruction'],
+              fallback: sorting['instruction'].toString())),
+          primary: false),
       const SizedBox(height: KinCareSpace.x4),
       for (final item in items) ...[
         _sortingItem(item, categories),
@@ -415,36 +647,67 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
                       (item) => item['id'] == _selectedSortingItem,
                     );
                     setState(() {
-                      _placements[_selectedSortingItem!] = category['id'].toString();
+                      _placements[_selectedSortingItem!] =
+                          category['id'].toString();
                       _selectedSortingItem = null;
-                      _feedback = 'Object placed. Choose it again if you would like to move it.';
+                      _feedback =
+                          'Object placed. Choose it again if you would like to move it.';
                     });
                     _speak(spokenPlacement(
                       _languageCode,
-                      _spoken(selectedItem['spoken'], fallback: selectedItem['label'].toString()),
-                      _spoken(category['spoken'], fallback: category['label'].toString()),
+                      _spoken(selectedItem['spoken'],
+                          fallback: selectedItem['label'].toString()),
+                      _spoken(category['spoken'],
+                          fallback: category['label'].toString()),
                     ));
                   },
             primary: false,
           );
           return constraints.maxWidth < 520
-              ? Padding(padding: const EdgeInsets.only(bottom: KinCareSpace.x2), child: button)
+              ? Padding(
+                  padding: const EdgeInsets.only(bottom: KinCareSpace.x2),
+                  child: button)
               : Expanded(child: button);
         }).toList();
         return constraints.maxWidth < 520
-            ? Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: buttons)
-            : Row(children: [buttons[0], const SizedBox(width: KinCareSpace.x3), buttons[1]]);
+            ? Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: buttons)
+            : Row(children: [
+                buttons[0],
+                const SizedBox(width: KinCareSpace.x3),
+                buttons[1]
+              ]);
       }),
-      if (_feedback != null) ...[const SizedBox(height: KinCareSpace.x3), Text(_feedback!, textAlign: TextAlign.center, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600, color: KinCareColors.forest))],
-      if (_error != null) ...[const SizedBox(height: KinCareSpace.x2), _bigButton('Try saving again', _busy ? null : () => _finishSorting(sorting), primary: false)],
+      if (_feedback != null) ...[
+        const SizedBox(height: KinCareSpace.x3),
+        Text(_feedback!,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w600,
+                color: KinCareColors.forest))
+      ],
+      if (_error != null) ...[
+        const SizedBox(height: KinCareSpace.x2),
+        _bigButton(
+            'Try saving again', _busy ? null : () => _finishSorting(sorting),
+            primary: false)
+      ],
       const SizedBox(height: KinCareSpace.x4),
-      _bigButton(_busy ? 'Saving your choices…' : 'Finish Sorting', _placements.length == items.length && !_busy ? () => _finishSorting(sorting) : null),
+      _bigButton(
+          _busy ? 'Saving your choices…' : 'Finish Sorting',
+          _placements.length == items.length && !_busy
+              ? () => _finishSorting(sorting)
+              : null),
     ]));
   }
 
-  Widget _sortingItem(Map<String, dynamic> item, List<Map<String, dynamic>> categories) {
+  Widget _sortingItem(
+      Map<String, dynamic> item, List<Map<String, dynamic>> categories) {
     final categoryId = _placements[item['id']];
-    final category = categories.where((row) => row['id'] == categoryId).firstOrNull;
+    final category =
+        categories.where((row) => row['id'] == categoryId).firstOrNull;
     return SizedBox(
       height: 82,
       child: OutlinedButton(
@@ -454,15 +717,30 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
           _speak(_spoken(item['spoken'], fallback: item['label'].toString()));
         }),
         style: OutlinedButton.styleFrom(
-          backgroundColor: _selectedSortingItem == item['id'] ? KinCareColors.paleSage : KinCareColors.offWhite,
-          side: BorderSide(color: _selectedSortingItem == item['id'] ? KinCareColors.sage : KinCareColors.lineStrong, width: 2),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(KinCareRadii.md)),
+          backgroundColor: _selectedSortingItem == item['id']
+              ? KinCareColors.paleSage
+              : KinCareColors.offWhite,
+          side: BorderSide(
+              color: _selectedSortingItem == item['id']
+                  ? KinCareColors.sage
+                  : KinCareColors.lineStrong,
+              width: 2),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(KinCareRadii.md)),
         ),
         child: Row(children: [
-          Text(item['illustration'].toString(), style: const TextStyle(fontSize: 34)),
+          Text(item['illustration'].toString(),
+              style: const TextStyle(fontSize: 34)),
           const SizedBox(width: KinCareSpace.x3),
-          Expanded(child: Text(item['label'].toString(), style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: KinCareColors.forest))),
-          Text(category == null ? 'Choose' : 'In ${category['label']}', style: const TextStyle(fontSize: 15, color: KinCareColors.textMuted)),
+          Expanded(
+              child: Text(item['label'].toString(),
+                  style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w700,
+                      color: KinCareColors.forest))),
+          Text(category == null ? 'Choose' : 'In ${category['label']}',
+              style: const TextStyle(
+                  fontSize: 15, color: KinCareColors.textMuted)),
         ]),
       ),
     );
