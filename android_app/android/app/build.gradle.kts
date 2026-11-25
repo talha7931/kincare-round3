@@ -38,6 +38,14 @@ android {
     }
 }
 
+// Keep the universal release APK compact without removing any supported ABI.
+// Android extracts these compressed native libraries when the APK is installed.
+androidComponents {
+    onVariants(selector().withBuildType("release")) { variant ->
+        variant.packaging.jniLibs.useLegacyPackaging.set(true)
+    }
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

@@ -3,16 +3,19 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_theme.dart';
 import 'engagement_reporting.dart';
+import 'offline_store.dart';
 
 class CaregiverDashboardScreen extends StatefulWidget {
   final List<Map<String, dynamic>> profiles;
   final String caregiverName;
+  final String? ownerId;
   final ValueChanged<String> onOpenProfileReport;
 
   const CaregiverDashboardScreen({
     super.key,
     required this.profiles,
     required this.caregiverName,
+    this.ownerId,
     required this.onOpenProfileReport,
   });
 
@@ -54,8 +57,11 @@ class _CaregiverDashboardScreenState extends State<CaregiverDashboardScreen> {
       _error = null;
     });
     try {
-      final data = await loadCaregiverReportingData(
-        Supabase.instance.client,
+      final client = Supabase.instance.client;
+      final data = await loadCaregiverReportingDataLocalFirst(
+        client,
+        OfflineStore.instance,
+        widget.ownerId ?? client.auth.currentUser?.id ?? '',
         widget.profiles,
       );
       if (mounted)
@@ -148,8 +154,8 @@ class _CaregiverDashboardScreenState extends State<CaregiverDashboardScreen> {
             const SizedBox(height: KinCareSpace.x4),
             _recentActivity(recent, profileNames),
             const SizedBox(height: KinCareSpace.x3),
-            const Text(
-              'Cloud coverage: synced activity visible to this caregiver. Dates and trends use UTC. This is an engagement summary, not a clinical assessment.',
+            Text(
+              'Locally available: ${_sessions.length} activities · ${_sessions.where((row) => row.syncState != 'synced').length} waiting to sync. Cloud data refreshes when connected. Dates and trends use UTC. This is an engagement summary, not a clinical assessment.',
               style: TextStyle(color: KinCareColors.textMuted),
             ),
           ],

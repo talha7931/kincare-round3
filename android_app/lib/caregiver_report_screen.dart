@@ -6,17 +6,20 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_theme.dart';
 import 'engagement_reporting.dart';
+import 'offline_store.dart';
 
 class CaregiverReportScreen extends StatefulWidget {
   final List<Map<String, dynamic>> profiles;
   final String caregiverName;
   final String? initialProfileId;
+  final String? ownerId;
 
   const CaregiverReportScreen({
     super.key,
     required this.profiles,
     required this.caregiverName,
     this.initialProfileId,
+    this.ownerId,
   });
 
   @override
@@ -70,8 +73,11 @@ class _CaregiverReportScreenState extends State<CaregiverReportScreen> {
       _error = null;
     });
     try {
-      final data = await loadCaregiverReportingData(
-        Supabase.instance.client,
+      final client = Supabase.instance.client;
+      final data = await loadCaregiverReportingDataLocalFirst(
+        client,
+        OfflineStore.instance,
+        widget.ownerId ?? client.auth.currentUser?.id ?? '',
         widget.profiles,
       );
       if (mounted)
@@ -136,6 +142,10 @@ class _CaregiverReportScreenState extends State<CaregiverReportScreen> {
         Text('Individual engagement report',
             style: Theme.of(context).textTheme.headlineSmall?.copyWith(
                 color: KinCareColors.forest, fontWeight: FontWeight.w700)),
+        const SizedBox(height: KinCareSpace.x3),
+        Text(
+            'Locally available: ${_sessions.length} activities · ${_sessions.where((row) => row.syncState != 'synced').length} waiting to sync. Cloud-confirmed records refresh when connected.',
+            style: const TextStyle(color: KinCareColors.textMuted)),
         const SizedBox(height: KinCareSpace.x3),
         if (widget.profiles.isEmpty)
           const Card(
@@ -340,6 +350,9 @@ class _CaregiverReportScreenState extends State<CaregiverReportScreen> {
       final activityRows = metrics.sessionsByActivity.entries.toList()
         ..sort((a, b) => a.key.compareTo(b.key));
       final sessions = _periodSessions;
+      final pendingLocal =
+          sessions.where((row) => row.syncState != 'synced').length;
+      final cloudConfirmed = sessions.length - pendingLocal;
       document.addPage(pw.MultiPage(
         pageFormat: PdfPageFormat.a4,
         margin: const pw.EdgeInsets.all(36),
@@ -386,7 +399,7 @@ class _CaregiverReportScreenState extends State<CaregiverReportScreen> {
               style:
                   pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
           pw.Text(
-              'Cloud coverage: synced activity rows visible to this caregiver under existing access policies.'),
+              'Coverage: $cloudConfirmed cloud-synchronized activities; $pendingLocal locally saved and waiting to synchronize; ${sessions.length} total available for this profile and period.'),
           pw.Text(
               'Sessions: ${metrics.totalSessions} · Completed: ${metrics.completedSessions} · Stopped early: ${metrics.abandonedSessions} · In progress: ${metrics.inProgressSessions}'),
           pw.Text(

@@ -36,18 +36,23 @@ class OfflineSyncStatusBar extends StatelessWidget {
               KinCareColors.textMuted
             ),
           OfflineSyncState.pending => (
-              '${status.pending} activity record${status.pending == 1 ? '' : 's'} waiting to sync',
+              '${status.pending} saved change${status.pending == 1 ? '' : 's'} waiting to sync',
               Icons.cloud_upload_outlined,
               KinCareColors.forest
             ),
           OfflineSyncState.syncing => (
-              'Syncing activity…',
+              'Syncing saved changes…',
               Icons.sync,
               KinCareColors.forest
             ),
           OfflineSyncState.failed => (
-              '${status.failed} record${status.failed == 1 ? '' : 's'} need retry',
+              '${status.failed} change${status.failed == 1 ? '' : 's'} need retry',
               Icons.cloud_queue_outlined,
+              KinCareColors.danger
+            ),
+          OfflineSyncState.conflict => (
+              '${status.conflicts} change${status.conflicts == 1 ? '' : 's'} need your review',
+              Icons.warning_amber_rounded,
               KinCareColors.danger
             ),
           OfflineSyncState.synchronized => (
@@ -79,12 +84,84 @@ class OfflineSyncStatusBar extends StatelessWidget {
                         ? null
                         : () => service.syncNow(forceRetry: true),
                     child: const Text('Sync Now')),
+              if (status.conflicts > 0)
+                TextButton(
+                    onPressed: () => _reviewConflicts(context, service),
+                    child: const Text('Review')),
             ]),
           ),
         );
       },
     );
   }
+}
+
+Future<void> _reviewConflicts(
+    BuildContext context, OfflineSyncService service) async {
+  final ownerId = Supabase.instance.client.auth.currentUser?.id;
+  if (ownerId == null) return;
+  final conflicts = await service.store.conflicts(ownerId);
+  for (final conflict in conflicts) {
+    if (!context.mounted) return;
+    final local = Map<String, dynamic>.from(conflict['local_payload'] as Map);
+    final remote = Map<String, dynamic>.from(conflict['remote_payload'] as Map);
+    final localLabel = _conflictSummary(local);
+    final remoteLabel = remote['_remote_deleted'] == true
+        ? 'The cloud record was deleted.'
+        : _conflictSummary(remote);
+    final keepLocal = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Review saved changes'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('On this device: $localLabel'),
+              const SizedBox(height: 12),
+              Text('In KinCare cloud: $remoteLabel'),
+              const SizedBox(height: 12),
+              const Text('Choose which version to keep.'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dialogContext, null),
+              child: const Text('Later')),
+          TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Use cloud version')),
+          FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Keep this device version')),
+        ],
+      ),
+    );
+    if (keepLocal == null) return;
+    await service.store.resolveConflict(ownerId,
+        conflict['entity_type'].toString(), conflict['entity_id'].toString(),
+        keepLocal: keepLocal);
+  }
+  await service.refresh();
+  if (service.snapshot.pending > 0) {
+    await service.syncNow(forceRetry: true);
+  }
+}
+
+String _conflictSummary(Map<String, dynamic> payload) {
+  for (final key in [
+    'display_name',
+    'title',
+    'question_text',
+    'answer_context'
+  ]) {
+    final value = payload[key]?.toString().trim();
+    if (value != null && value.isNotEmpty) return value;
+  }
+  if (payload['_remote_deleted'] == true) return 'Deleted';
+  return 'Saved version';
 }
 
 String _shortTime(String value) {

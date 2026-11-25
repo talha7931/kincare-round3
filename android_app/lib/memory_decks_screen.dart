@@ -7,44 +7,15 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:record/record.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'app_theme.dart';
+import 'offline_store.dart';
+import 'offline_sync.dart';
 
 // ---------------------------------------------------------------------------
 // Media helpers
 // ---------------------------------------------------------------------------
-
-Future<String> _uploadMediaAsset({
-  required SupabaseClient client,
-  required File file,
-  required String elderlyProfileId,
-  required String userId,
-  required String mediaType,
-  required String mimeType,
-}) async {
-  const uuid = Uuid();
-  final assetId = uuid.v4();
-  final ext = file.path.split('.').last.toLowerCase();
-  final storagePath = '$elderlyProfileId/$assetId.$ext';
-
-  await client.storage.from('kincare-media').upload(
-        storagePath,
-        file,
-        fileOptions: FileOptions(contentType: mimeType),
-      );
-
-  await client.from('media_assets').insert({
-    'id': assetId,
-    'elderly_profile_id': elderlyProfileId,
-    'uploaded_by_caregiver_id': userId,
-    'storage_bucket': 'kincare-media',
-    'storage_path': storagePath,
-    'media_type': mediaType,
-    'mime_type': mimeType,
-  });
-
-  return assetId;
-}
 
 Future<String> _getSignedUrl(SupabaseClient client, String storagePath) async {
   final response = await client.storage
@@ -108,21 +79,47 @@ class _MemoryDecksScreenState extends State<MemoryDecksScreen> {
     try {
       final data = await _client
           .from('memory_decks')
-          .select('id, title, language_code, created_at, updated_at')
+          .select(
+              'id, elderly_profile_id, created_by_caregiver_id, title, language_code, created_at, updated_at')
           .eq('elderly_profile_id', profileId)
-          .order('created_at');
-      // Fetch card counts per deck
+          .order('created_at')
+          .timeout(const Duration(seconds: 8));
       final deckList = List<Map<String, dynamic>>.from(data);
       for (final deck in deckList) {
+        final cardSnapshotStartedAt = DateTime.now().toUtc();
         final countResult = await _client
             .from('memory_cards')
-            .select('id')
-            .eq('deck_id', deck['id']);
-        deck['_card_count'] = (countResult as List).length;
+            .select(
+                'id, deck_id, photo_asset_id, question_audio_asset_id, answer_audio_asset_id, question_text, answer_context, display_order')
+            .eq('deck_id', deck['id'])
+            .order('display_order');
+        final cards = List<Map<String, dynamic>>.from(countResult);
+        await OfflineStore.instance.cacheDeck(
+            widget.user.id, profileId, deck, cards,
+            remoteSnapshotStartedAt: cardSnapshotStartedAt);
       }
-      setState(() => _decks = deckList);
+      final localDecks =
+          await OfflineStore.instance.readDecks(widget.user.id, profileId);
+      for (final deck in localDecks) {
+        deck['_card_count'] = (await OfflineStore.instance
+                .readCards(widget.user.id, deck['id'].toString()))
+            .length;
+      }
+      if (mounted) setState(() => _decks = localDecks);
     } catch (e) {
-      setState(() => _error = e.toString());
+      final localDecks =
+          await OfflineStore.instance.readDecks(widget.user.id, profileId);
+      for (final deck in localDecks) {
+        deck['_card_count'] = (await OfflineStore.instance
+                .readCards(widget.user.id, deck['id'].toString()))
+            .length;
+      }
+      if (mounted) {
+        setState(() {
+          _decks = localDecks;
+          if (localDecks.isEmpty) _error = e.toString();
+        });
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -139,13 +136,23 @@ class _MemoryDecksScreenState extends State<MemoryDecksScreen> {
     if (result == null) return;
 
     try {
-      await _client.from('memory_decks').insert({
+      final deck = <String, dynamic>{
+        'id': const Uuid().v4(),
         'elderly_profile_id': profileId,
         'created_by_caregiver_id': widget.user.id,
         'title': result['title'],
         'language_code': result['language_code'],
-      });
+        'created_at': DateTime.now().toUtc().toIso8601String(),
+      };
+      await OfflineStore.instance
+          .saveDeckLocal(widget.user.id, profileId, deck);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content:
+                Text('Deck saved on this device; waiting to synchronize.')));
+      }
       await _loadDecks();
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -167,12 +174,16 @@ class _MemoryDecksScreenState extends State<MemoryDecksScreen> {
     if (result == null) return;
 
     try {
-      await _client.from('memory_decks').update({
+      final updated = <String, dynamic>{
+        ...deck,
         'title': result['title'],
         'language_code': result['language_code'],
         'updated_at': DateTime.now().toIso8601String(),
-      }).eq('id', deck['id']);
+      };
+      await OfflineStore.instance.saveDeckLocal(
+          widget.user.id, widget.selectedProfile!['id'].toString(), updated);
       await _loadDecks();
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -205,8 +216,10 @@ class _MemoryDecksScreenState extends State<MemoryDecksScreen> {
     if (confirmed != true) return;
 
     try {
-      await _client.from('memory_decks').delete().eq('id', deck['id']);
+      await OfflineStore.instance
+          .deleteDeckLocal(widget.user.id, deck['id'].toString());
       await _loadDecks();
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -363,11 +376,18 @@ class _DeckGrid extends StatelessWidget {
                           ),
                         ),
                         const SizedBox(height: 2),
-                        Row(
+                        Wrap(
+                          spacing: KinCareSpace.x2,
+                          runSpacing: KinCareSpace.x1,
                           children: [
                             _Chip(label: lang),
-                            const SizedBox(width: KinCareSpace.x2),
-                            _Chip(label: '$cardCount card${cardCount == 1 ? '' : 's'}'),
+                            _Chip(
+                                label:
+                                    '$cardCount card${cardCount == 1 ? '' : 's'}'),
+                            _Chip(
+                                label: _deckSyncLabel(
+                                    deck['_sync_state']?.toString() ??
+                                        'synced')),
                           ],
                         ),
                       ],
@@ -417,6 +437,17 @@ class _Chip extends StatelessWidget {
     );
   }
 }
+
+String _deckSyncLabel(String state) => switch (state) {
+      'pending_create' ||
+      'pending_update' ||
+      'pending_delete' ||
+      'local_only' =>
+        'Saved here · waiting to sync',
+      'failed' => 'Sync failed',
+      'conflict' => 'Needs review',
+      _ => 'Synced',
+    };
 
 // ---------------------------------------------------------------------------
 // Empty + error states
@@ -472,7 +503,8 @@ class _ErrorView extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.error_outline, size: 48, color: KinCareColors.danger),
+            const Icon(Icons.error_outline,
+                size: 48, color: KinCareColors.danger),
             const SizedBox(height: KinCareSpace.x3),
             Text(error,
                 textAlign: TextAlign.center,
@@ -512,8 +544,7 @@ class _DeckFormDialogState extends State<_DeckFormDialog> {
   @override
   void initState() {
     super.initState();
-    _titleController =
-        TextEditingController(text: widget.initialTitle ?? '');
+    _titleController = TextEditingController(text: widget.initialTitle ?? '');
     _language = widget.initialLanguage ?? 'en';
   }
 
@@ -587,6 +618,7 @@ class DeckDetailScreen extends StatefulWidget {
 
 class _DeckDetailScreenState extends State<DeckDetailScreen> {
   final _client = Supabase.instance.client;
+  final _store = OfflineStore.instance;
 
   List<Map<String, dynamic>> _cards = [];
   bool _loading = true;
@@ -600,19 +632,42 @@ class _DeckDetailScreenState extends State<DeckDetailScreen> {
 
   Future<void> _loadCards() async {
     setState(() {
-      _loading = true;
+      if (_cards.isEmpty) _loading = true;
       _error = null;
     });
     try {
+      final cached =
+          await _store.readCards(widget.user.id, widget.deck['id'].toString());
+      if (cached.isNotEmpty && mounted) {
+        setState(() {
+          _cards = cached;
+          _loading = false;
+        });
+      }
+      final cardSnapshotStartedAt = DateTime.now().toUtc();
       final data = await _client
           .from('memory_cards')
           .select(
               'id, deck_id, photo_asset_id, question_audio_asset_id, answer_audio_asset_id, question_text, answer_context, display_order')
           .eq('deck_id', widget.deck['id'])
-          .order('display_order');
-      setState(() => _cards = List<Map<String, dynamic>>.from(data));
+          .order('display_order')
+          .timeout(const Duration(seconds: 8));
+      final cards = List<Map<String, dynamic>>.from(data);
+      await _store.cacheDeck(
+          widget.user.id, widget.elderlyProfileId, widget.deck, cards,
+          remoteSnapshotStartedAt: cardSnapshotStartedAt);
+      final local =
+          await _store.readCards(widget.user.id, widget.deck['id'].toString());
+      if (mounted) setState(() => _cards = local);
     } catch (e) {
-      setState(() => _error = e.toString());
+      final local =
+          await _store.readCards(widget.user.id, widget.deck['id'].toString());
+      if (mounted) {
+        setState(() {
+          _cards = local;
+          if (local.isEmpty) _error = e.toString();
+        });
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -640,13 +695,36 @@ class _DeckDetailScreenState extends State<DeckDetailScreen> {
     if (confirmed != true) return;
 
     try {
-      await _client.from('memory_cards').delete().eq('id', card['id']);
+      await _store.deleteCardLocal(widget.user.id, card['id'].toString());
       await _loadCards();
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Failed to delete card: $e')),
         );
+      }
+    }
+  }
+
+  Future<void> _reorderCards(int oldIndex, int newIndex) async {
+    final reordered = List<Map<String, dynamic>>.from(_cards);
+    final card = reordered.removeAt(oldIndex);
+    reordered.insert(newIndex, card);
+    setState(() => _cards = reordered);
+    try {
+      await _store.reorderCardsLocal(
+          widget.user.id,
+          widget.deck['id'].toString(),
+          reordered.map((item) => item['id'].toString()).toList());
+      await _loadCards();
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not reorder cards: $error')),
+        );
+        await _loadCards();
       }
     }
   }
@@ -718,26 +796,33 @@ class _DeckDetailScreenState extends State<DeckDetailScreen> {
                         ),
                       ),
                     )
-                  : ListView.separated(
+                  : ReorderableListView.builder(
+                      onReorderItem: _reorderCards,
                       padding: const EdgeInsets.all(KinCareSpace.x4),
                       itemCount: _cards.length,
-                      separatorBuilder: (_, __) =>
-                          const SizedBox(height: KinCareSpace.x3),
-                      itemBuilder: (ctx, i) => _CardTile(
-                        card: _cards[i],
-                        client: _client,
-                        onEdit: () => Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => CardEditorScreen(
-                              deck: widget.deck,
-                              user: widget.user,
-                              elderlyProfileId: widget.elderlyProfileId,
-                              existingCard: _cards[i],
-                            ),
+                      itemBuilder: (ctx, i) => Padding(
+                        key: ValueKey(_cards[i]['id']),
+                        padding: const EdgeInsets.only(bottom: KinCareSpace.x3),
+                        child: ReorderableDelayedDragStartListener(
+                          index: i,
+                          child: _CardTile(
+                            card: _cards[i],
+                            client: _client,
+                            ownerId: widget.user.id,
+                            onEdit: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => CardEditorScreen(
+                                  deck: widget.deck,
+                                  user: widget.user,
+                                  elderlyProfileId: widget.elderlyProfileId,
+                                  existingCard: _cards[i],
+                                ),
+                              ),
+                            ).then((_) => _loadCards()),
+                            onDelete: () => _deleteCard(_cards[i]),
                           ),
-                        ).then((_) => _loadCards()),
-                        onDelete: () => _deleteCard(_cards[i]),
+                        ),
                       ),
                     ),
     );
@@ -751,12 +836,14 @@ class _DeckDetailScreenState extends State<DeckDetailScreen> {
 class _CardTile extends StatefulWidget {
   final Map<String, dynamic> card;
   final SupabaseClient client;
+  final String ownerId;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
 
   const _CardTile({
     required this.card,
     required this.client,
+    required this.ownerId,
     required this.onEdit,
     required this.onDelete,
   });
@@ -767,6 +854,7 @@ class _CardTile extends StatefulWidget {
 
 class _CardTileState extends State<_CardTile> {
   String? _photoUrl;
+  String? _localPhotoPath;
   bool _loadingPhoto = false;
 
   @override
@@ -781,14 +869,19 @@ class _CardTileState extends State<_CardTile> {
 
     try {
       setState(() => _loadingPhoto = true);
+      final localPath =
+          await OfflineStore.instance.mediaPath(widget.ownerId, assetId);
+      if (localPath != null) {
+        if (mounted) setState(() => _localPhotoPath = localPath);
+        return;
+      }
       final assetRow = await widget.client
           .from('media_assets')
           .select('storage_path')
           .eq('id', assetId)
           .maybeSingle();
       if (assetRow == null) return;
-      final url =
-          await _getSignedUrl(widget.client, assetRow['storage_path']);
+      final url = await _getSignedUrl(widget.client, assetRow['storage_path']);
       if (mounted) setState(() => _photoUrl = url);
     } catch (_) {
       // non-fatal
@@ -802,6 +895,17 @@ class _CardTileState extends State<_CardTile> {
     final card = widget.card;
     final hasQuestionAudio = card['question_audio_asset_id'] != null;
     final hasAnswerAudio = card['answer_audio_asset_id'] != null;
+    final syncState = card['_sync_state']?.toString() ?? 'synced';
+    final syncMessage = switch (syncState) {
+      'pending_create' ||
+      'pending_update' ||
+      'local_only' =>
+        'Saved on this device; waiting to sync.',
+      'failed' =>
+        'Sync failed. Card is still saved here; use Sync Now to retry.',
+      'conflict' => 'Sync needs review. Card is still saved here.',
+      _ => null,
+    };
 
     return Card(
       child: Padding(
@@ -821,10 +925,16 @@ class _CardTileState extends State<_CardTile> {
                             width: 24,
                             height: 24,
                             child: CircularProgressIndicator(strokeWidth: 2)))
-                    : _photoUrl != null
-                        ? Image.network(_photoUrl!, fit: BoxFit.cover,
+                    : _localPhotoPath != null
+                        ? Image.file(File(_localPhotoPath!),
+                            fit: BoxFit.cover,
                             errorBuilder: (_, __, ___) => _photoPlaceholder())
-                        : _photoPlaceholder(),
+                        : _photoUrl != null
+                            ? Image.network(_photoUrl!,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, __, ___) =>
+                                    _photoPlaceholder())
+                            : _photoPlaceholder(),
               ),
             ),
             const SizedBox(width: KinCareSpace.x3),
@@ -854,14 +964,24 @@ class _CardTileState extends State<_CardTile> {
                   const SizedBox(height: 6),
                   Row(
                     children: [
-                      if (hasQuestionAudio)
-                        const _Chip(label: '🎤 Q audio'),
+                      if (hasQuestionAudio) const _Chip(label: '🎤 Q audio'),
                       if (hasQuestionAudio && hasAnswerAudio)
                         const SizedBox(width: 4),
-                      if (hasAnswerAudio)
-                        const _Chip(label: '🔊 A audio'),
+                      if (hasAnswerAudio) const _Chip(label: '🔊 A audio'),
                     ],
                   ),
+                  if (syncMessage != null) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      syncMessage,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: syncState == 'failed' || syncState == 'conflict'
+                            ? KinCareColors.danger
+                            : KinCareColors.textMuted,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -890,8 +1010,8 @@ class _CardTileState extends State<_CardTile> {
   Widget _photoPlaceholder() {
     return Container(
       color: KinCareColors.paleSage,
-      child: const Icon(Icons.image_outlined,
-          size: 36, color: KinCareColors.sage),
+      child:
+          const Icon(Icons.image_outlined, size: 36, color: KinCareColors.sage),
     );
   }
 }
@@ -920,6 +1040,8 @@ class CardEditorScreen extends StatefulWidget {
 
 class _CardEditorScreenState extends State<CardEditorScreen> {
   final _client = Supabase.instance.client;
+  final _store = OfflineStore.instance;
+  late final String _cardId;
 
   final _questionController = TextEditingController();
   final _answerController = TextEditingController();
@@ -928,13 +1050,16 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
   File? _photoFile;
   String? _existingPhotoAssetId;
   String? _existingPhotoUrl;
+  bool _photoIsDurable = false;
 
   File? _questionAudioFile;
   String? _existingQuestionAudioAssetId;
+  bool _questionAudioIsDurable = false;
   bool _recordingQuestion = false;
 
   File? _answerAudioFile;
   String? _existingAnswerAudioAssetId;
+  bool _answerAudioIsDurable = false;
   bool _recordingAnswer = false;
 
   final AudioRecorder _recorder = AudioRecorder();
@@ -949,6 +1074,7 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
   @override
   void initState() {
     super.initState();
+    _cardId = widget.existingCard?['id']?.toString() ?? const Uuid().v4();
     final card = widget.existingCard;
     if (card != null) {
       _questionController.text = card['question_text']?.toString() ?? '';
@@ -957,9 +1083,8 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
       _existingPhotoAssetId = card['photo_asset_id']?.toString();
       _existingQuestionAudioAssetId =
           card['question_audio_asset_id']?.toString();
-      _existingAnswerAudioAssetId =
-          card['answer_audio_asset_id']?.toString();
-      _loadExistingPhoto();
+      _existingAnswerAudioAssetId = card['answer_audio_asset_id']?.toString();
+      _loadExistingMedia();
     }
 
     _player.onPlayerComplete.listen((_) {
@@ -982,19 +1107,51 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
     super.dispose();
   }
 
-  Future<void> _loadExistingPhoto() async {
-    if (_existingPhotoAssetId == null) return;
+  Future<void> _loadExistingMedia() async {
+    final photoId = _existingPhotoAssetId;
+    final questionId = _existingQuestionAudioAssetId;
+    final answerId = _existingAnswerAudioAssetId;
     try {
+      final photoPath = photoId == null
+          ? null
+          : await _store.mediaPath(widget.user.id, photoId);
+      final questionPath = questionId == null
+          ? null
+          : await _store.mediaPath(widget.user.id, questionId);
+      final answerPath = answerId == null
+          ? null
+          : await _store.mediaPath(widget.user.id, answerId);
+      if (mounted && photoPath != null) {
+        setState(() {
+          _photoFile = File(photoPath);
+          _photoIsDurable = true;
+        });
+      }
+      if (mounted && questionPath != null) {
+        setState(() {
+          _questionAudioFile = File(questionPath);
+          _questionAudioIsDurable = true;
+        });
+      }
+      if (mounted && answerPath != null) {
+        setState(() {
+          _answerAudioFile = File(answerPath);
+          _answerAudioIsDurable = true;
+        });
+      }
+      if (photoPath != null || photoId == null) return;
       final row = await _client
           .from('media_assets')
           .select('storage_path')
-          .eq('id', _existingPhotoAssetId!)
+          .eq('id', photoId)
           .maybeSingle();
       if (row != null && mounted) {
         final url = await _getSignedUrl(_client, row['storage_path']);
         setState(() => _existingPhotoUrl = url);
       }
-    } catch (_) {}
+    } catch (_) {
+      // The card can still be edited using its text and stored asset IDs.
+    }
   }
 
   // ---- Photo ---------------------------------------------------------------
@@ -1006,14 +1163,20 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
       imageQuality: 85,
     );
     if (picked != null && mounted) {
-      setState(() => _photoFile = File(picked.path));
+      setState(() {
+        _photoFile = File(picked.path);
+        _photoIsDurable = false;
+      });
     }
   }
 
   // ---- Recording -----------------------------------------------------------
 
   Future<String> _tempAudioPath() async {
-    final dir = Directory.systemTemp;
+    final root = await getApplicationSupportDirectory();
+    final dir =
+        Directory('${root.path}${Platform.pathSeparator}pending-recordings');
+    await dir.create(recursive: true);
     final id = const Uuid().v4();
     return '${dir.path}/$id.m4a';
   }
@@ -1024,8 +1187,8 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-              content: Text(
-                  'Microphone permission denied. Grant it in Settings.')),
+              content:
+                  Text('Microphone permission denied. Grant it in Settings.')),
         );
       }
       return;
@@ -1048,10 +1211,12 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
       setState(() {
         if (role == 'question') {
           _questionAudioFile = file;
+          _questionAudioIsDurable = false;
           _recordingQuestion = false;
         }
         if (role == 'answer') {
           _answerAudioFile = file;
+          _answerAudioIsDurable = false;
           _recordingAnswer = false;
         }
       });
@@ -1071,6 +1236,16 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
 
   Future<void> _playRemote(String assetId, String role) async {
     try {
+      final localPath = await _store.mediaPath(widget.user.id, assetId);
+      if (localPath != null) {
+        await _player.stop();
+        setState(() {
+          _playingQuestion = role == 'question';
+          _playingAnswer = role == 'answer';
+        });
+        await _player.play(DeviceFileSource(localPath));
+        return;
+      }
       final row = await _client
           .from('media_assets')
           .select('storage_path')
@@ -1112,47 +1287,60 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
     });
 
     try {
-      // Upload photo if new
       String photoAssetId = _existingPhotoAssetId ?? '';
-      if (_photoFile != null) {
-        photoAssetId = await _uploadMediaAsset(
-          client: _client,
-          file: _photoFile!,
-          elderlyProfileId: widget.elderlyProfileId,
-          userId: widget.user.id,
+      if (_photoFile != null && !_photoIsDurable) {
+        photoAssetId = const Uuid().v4();
+        final path = await _store.importLocalMedia(
+          ownerId: widget.user.id,
+          assetId: photoAssetId,
+          profileId: widget.elderlyProfileId,
+          deckId: widget.deck['id'].toString(),
+          cardId: _cardId,
           mediaType: 'photo',
           mimeType: 'image/jpeg',
+          source: _photoFile!,
         );
+        _photoFile = File(path);
+        _photoIsDurable = true;
       }
 
-      // Upload question audio if new
       String? questionAudioAssetId = _existingQuestionAudioAssetId;
-      if (_questionAudioFile != null) {
-        questionAudioAssetId = await _uploadMediaAsset(
-          client: _client,
-          file: _questionAudioFile!,
-          elderlyProfileId: widget.elderlyProfileId,
-          userId: widget.user.id,
+      if (_questionAudioFile != null && !_questionAudioIsDurable) {
+        questionAudioAssetId = const Uuid().v4();
+        final path = await _store.importLocalMedia(
+          ownerId: widget.user.id,
+          assetId: questionAudioAssetId,
+          profileId: widget.elderlyProfileId,
+          deckId: widget.deck['id'].toString(),
+          cardId: _cardId,
           mediaType: 'question_audio',
           mimeType: 'audio/m4a',
+          source: _questionAudioFile!,
         );
+        _questionAudioFile = File(path);
+        _questionAudioIsDurable = true;
       }
 
-      // Upload answer audio if new
       String? answerAudioAssetId = _existingAnswerAudioAssetId;
-      if (_answerAudioFile != null) {
-        answerAudioAssetId = await _uploadMediaAsset(
-          client: _client,
-          file: _answerAudioFile!,
-          elderlyProfileId: widget.elderlyProfileId,
-          userId: widget.user.id,
+      if (_answerAudioFile != null && !_answerAudioIsDurable) {
+        answerAudioAssetId = const Uuid().v4();
+        final path = await _store.importLocalMedia(
+          ownerId: widget.user.id,
+          assetId: answerAudioAssetId,
+          profileId: widget.elderlyProfileId,
+          deckId: widget.deck['id'].toString(),
+          cardId: _cardId,
           mediaType: 'answer_audio',
           mimeType: 'audio/m4a',
+          source: _answerAudioFile!,
         );
+        _answerAudioFile = File(path);
+        _answerAudioIsDurable = true;
       }
 
       final displayOrder = int.tryParse(_orderController.text) ?? 0;
       final cardData = {
+        'id': _cardId,
         'deck_id': widget.deck['id'],
         'photo_asset_id': photoAssetId,
         'question_audio_asset_id': questionAudioAssetId,
@@ -1162,13 +1350,13 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
         'display_order': displayOrder,
       };
 
-      if (widget.existingCard != null) {
-        await _client
-            .from('memory_cards')
-            .update(cardData)
-            .eq('id', widget.existingCard!['id']);
-      } else {
-        await _client.from('memory_cards').insert(cardData);
+      await _store.saveCardLocal(
+          widget.user.id, widget.deck['id'].toString(), cardData);
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content:
+                Text('Card saved on this device; waiting to synchronize.')));
       }
 
       if (mounted) Navigator.pop(context);
@@ -1273,7 +1461,8 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
                   ? () => _playLocal(_questionAudioFile!, 'question')
                   : null,
               onPlayRemote: _existingQuestionAudioAssetId != null
-                  ? () => _playRemote(_existingQuestionAudioAssetId!, 'question')
+                  ? () =>
+                      _playRemote(_existingQuestionAudioAssetId!, 'question')
                   : null,
               onStopPlay: () async {
                 await _player.stop();
@@ -1311,8 +1500,7 @@ class _CardEditorScreenState extends State<CardEditorScreen> {
             const SizedBox(height: KinCareSpace.x2),
             TextField(
               controller: _orderController,
-              decoration:
-                  const InputDecoration(hintText: '0 = first'),
+              decoration: const InputDecoration(hintText: '0 = first'),
               keyboardType: TextInputType.number,
             ),
             const SizedBox(height: KinCareSpace.x7),
@@ -1369,8 +1557,8 @@ class _PhotoPicker extends StatelessWidget {
     if (file != null) {
       preview = Image.file(file!, fit: BoxFit.cover);
     } else if (existingUrl != null) {
-      preview = Image.network(existingUrl!, fit: BoxFit.cover,
-          errorBuilder: (_, __, ___) => _placeholder());
+      preview = Image.network(existingUrl!,
+          fit: BoxFit.cover, errorBuilder: (_, __, ___) => _placeholder());
     } else {
       preview = _placeholder();
     }
@@ -1474,8 +1662,8 @@ class _AudioRecorderWidget extends StatelessWidget {
           isRecording
               ? FilledButton.icon(
                   onPressed: onStopRecord,
-                  icon:
-                      const Icon(Icons.stop_circle_outlined, color: KinCareColors.white),
+                  icon: const Icon(Icons.stop_circle_outlined,
+                      color: KinCareColors.white),
                   label: const Text('Stop'),
                   style: FilledButton.styleFrom(
                       backgroundColor: KinCareColors.danger),
@@ -1505,8 +1693,7 @@ class _AudioRecorderWidget extends StatelessWidget {
                     fontWeight: FontWeight.w600))
           else
             const Text('No audio',
-                style:
-                    TextStyle(color: KinCareColors.textMuted, fontSize: 13)),
+                style: TextStyle(color: KinCareColors.textMuted, fontSize: 13)),
 
           const Spacer(),
 

@@ -20,7 +20,7 @@ class OfflineStore {
   Future<Database> get database async {
     if (_database != null) return _database!;
     final path = await _databasePathProvider();
-    _database = await openDatabase(path, version: 4, onConfigure: (db) async {
+    _database = await openDatabase(path, version: 5, onConfigure: (db) async {
       await db.execute('PRAGMA foreign_keys = ON');
     }, onCreate: (db, _) async {
       await db.execute('''CREATE TABLE profiles (
@@ -63,11 +63,13 @@ class OfflineStore {
       await db.execute(
           'CREATE INDEX responses_session_idx ON responses(session_id, response_index)');
       await _createCacheTables(db);
+      await _migrateV5(db);
     }, onUpgrade: (db, oldVersion, newVersion) async {
       // Additive-only migrations. Existing activity/outbox rows are untouched.
       if (oldVersion < 2) await _createCacheTables(db);
       if (oldVersion < 3) await _migrateResponseForeignKey(db);
       if (oldVersion < 4) await _migrateCardForeignKey(db);
+      if (oldVersion < 5) await _migrateV5(db);
     });
     return _database!;
   }
@@ -129,15 +131,67 @@ class OfflineStore {
       PRIMARY KEY(caregiver_id, item_type, item_id))''');
   }
 
-  Future<void> cacheCaregiver(String ownerId, Map<String, dynamic> row) async =>
-      (await database).insert(
-          'caregiver_cache',
-          {
-            'caregiver_id': ownerId,
-            'payload': jsonEncode(row),
-            'cached_at': DateTime.now().toUtc().toIso8601String()
-          },
-          conflictAlgorithm: ConflictAlgorithm.replace);
+  /// Adds only local-first metadata. Existing cache/activity rows are retained.
+  Future<void> _migrateV5(DatabaseExecutor db) async {
+    await db.execute(
+        "ALTER TABLE caregiver_cache ADD COLUMN sync_state TEXT NOT NULL DEFAULT 'synced'");
+    await db
+        .execute('ALTER TABLE caregiver_cache ADD COLUMN base_payload TEXT');
+    for (final table in ['profiles', 'decks', 'cards']) {
+      await db.execute(
+          'ALTER TABLE $table ADD COLUMN sync_state TEXT NOT NULL DEFAULT \'synced\'');
+      await db.execute('ALTER TABLE $table ADD COLUMN base_payload TEXT');
+      await db.execute('ALTER TABLE $table ADD COLUMN deleted_at TEXT');
+    }
+    await db.execute(
+        "ALTER TABLE sync_outbox ADD COLUMN operation TEXT NOT NULL DEFAULT 'upsert'");
+    await db.execute('ALTER TABLE media_files ADD COLUMN profile_id TEXT');
+    await db.execute('ALTER TABLE media_files ADD COLUMN deck_id TEXT');
+    await db.execute('ALTER TABLE media_files ADD COLUMN card_id TEXT');
+    await db.execute('ALTER TABLE media_files ADD COLUMN media_type TEXT');
+    await db.execute('ALTER TABLE media_files ADD COLUMN storage_bucket TEXT');
+    await db.execute('ALTER TABLE media_files ADD COLUMN storage_path TEXT');
+    await db.execute('ALTER TABLE media_files ADD COLUMN file_size INTEGER');
+    await db.execute('ALTER TABLE media_files ADD COLUMN content_hash TEXT');
+    await db.execute(
+        "ALTER TABLE media_files ADD COLUMN upload_state TEXT NOT NULL DEFAULT 'cached'");
+    await db.execute(
+        'ALTER TABLE media_files ADD COLUMN upload_attempts INTEGER NOT NULL DEFAULT 0');
+    await db.execute('ALTER TABLE media_files ADD COLUMN last_error TEXT');
+    await db.execute(
+        'ALTER TABLE responses ADD COLUMN response_audio_asset_id TEXT');
+    await db.execute('''CREATE TABLE game_checkpoints (
+      caregiver_id TEXT NOT NULL, session_id TEXT NOT NULL, game_key TEXT NOT NULL,
+      payload TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(caregiver_id, session_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE)''');
+    await db.execute('''CREATE TABLE sync_conflicts (
+      caregiver_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+      operation TEXT NOT NULL, local_payload TEXT NOT NULL, remote_payload TEXT NOT NULL,
+      created_at TEXT NOT NULL, PRIMARY KEY(caregiver_id, entity_type, entity_id))''');
+    await db.execute(
+        'CREATE INDEX entity_sync_owner_state_idx ON sync_outbox(caregiver_id, state, operation, updated_at)');
+    await db.execute(
+        'CREATE INDEX checkpoints_profile_idx ON sessions(caregiver_id, profile_id, activity_key, status)');
+  }
+
+  Future<void> cacheCaregiver(String ownerId, Map<String, dynamic> row) async {
+    final db = await database;
+    final existing = await db.query('caregiver_cache',
+        where: 'caregiver_id = ?', whereArgs: [ownerId], limit: 1);
+    if (existing.isNotEmpty && existing.first['sync_state'] != 'synced') return;
+    final payload = jsonEncode(row);
+    await db.insert(
+        'caregiver_cache',
+        {
+          'caregiver_id': ownerId,
+          'payload': payload,
+          'base_payload': payload,
+          'sync_state': 'synced',
+          'cached_at': DateTime.now().toUtc().toIso8601String()
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
 
   Future<Map<String, dynamic>?> readCaregiver(String ownerId) async {
     final rows = await (await database).query('caregiver_cache',
@@ -146,8 +200,41 @@ class OfflineStore {
         whereArgs: [ownerId],
         limit: 1);
     if (rows.isEmpty) return null;
-    return Map<String, dynamic>.from(
-        jsonDecode(rows.first['payload']! as String) as Map);
+    return {
+      ...Map<String, dynamic>.from(
+          jsonDecode(rows.first['payload']! as String) as Map),
+      '_sync_state': rows.first['sync_state'],
+    };
+  }
+
+  Future<void> saveCaregiverLocal(
+      String ownerId, Map<String, dynamic> caregiver) async {
+    if (caregiver['id']?.toString() != ownerId) {
+      throw StateError(
+          'Caregiver identity does not match the signed-in account.');
+    }
+    final db = await database;
+    await db.transaction((txn) async {
+      final rows = await txn.query('caregiver_cache',
+          where: 'caregiver_id = ?', whereArgs: [ownerId], limit: 1);
+      final existingPayload = rows.isEmpty ? null : rows.first['payload'];
+      final base =
+          rows.isEmpty ? null : rows.first['base_payload'] ?? existingPayload;
+      await txn.insert(
+          'caregiver_cache',
+          {
+            'caregiver_id': ownerId,
+            'payload': jsonEncode(caregiver),
+            'base_payload': base,
+            'sync_state':
+                rows.isEmpty || rows.first['sync_state'] == 'pending_create'
+                    ? 'pending_create'
+                    : 'pending_update',
+            'cached_at': DateTime.now().toUtc().toIso8601String(),
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      await _queueEntity(txn, 'caregiver', ownerId, ownerId, 'upsert');
+    });
   }
 
   Future<void> cacheHistory(String ownerId, List<Map<String, dynamic>> sessions,
@@ -238,58 +325,556 @@ class OfflineStore {
   Future<void> cacheProfiles(
       String ownerId, List<Map<String, dynamic>> rows) async {
     final db = await database;
-    final batch = db.batch();
     final now = DateTime.now().toUtc().toIso8601String();
-    batch.delete('profiles', where: 'caregiver_id = ?', whereArgs: [ownerId]);
-    for (final row in rows) {
-      batch.insert(
-          'profiles',
-          {
-            'caregiver_id': ownerId,
-            'id': row['id'].toString(),
-            'payload': jsonEncode(row),
-            'cached_at': now
-          },
-          conflictAlgorithm: ConflictAlgorithm.replace);
-    }
-    await batch.commit(noResult: true);
+    await db.transaction((txn) async {
+      final existing = await txn
+          .query('profiles', where: 'caregiver_id = ?', whereArgs: [ownerId]);
+      final remoteById = {for (final row in rows) row['id'].toString(): row};
+      for (final cached in existing) {
+        final id = cached['id'].toString();
+        if (cached['sync_state'] == 'synced' && !remoteById.containsKey(id)) {
+          await txn.delete('profiles',
+              where: 'caregiver_id = ? AND id = ?', whereArgs: [ownerId, id]);
+        }
+      }
+      for (final row in rows) {
+        final id = row['id'].toString();
+        final cached = existing.where((item) => item['id'] == id).firstOrNull;
+        if (cached != null && cached['sync_state'] != 'synced') continue;
+        final payload = jsonEncode(row);
+        await txn.insert(
+            'profiles',
+            {
+              'caregiver_id': ownerId,
+              'id': id,
+              'payload': payload,
+              'base_payload': payload,
+              'sync_state': 'synced',
+              'deleted_at': null,
+              'cached_at': now
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
   }
 
   Future<List<Map<String, dynamic>>> readProfiles(String ownerId) async {
-    final rows = await (await database)
-        .query('profiles', where: 'caregiver_id = ?', whereArgs: [ownerId]);
+    final rows = await (await database).query('profiles',
+        where: 'caregiver_id = ? AND deleted_at IS NULL',
+        whereArgs: [ownerId],
+        orderBy: 'cached_at DESC');
     return rows
-        .map((row) => Map<String, dynamic>.from(
-            jsonDecode(row['payload']! as String) as Map))
+        .map((row) => {
+              ...Map<String, dynamic>.from(
+                  jsonDecode(row['payload']! as String) as Map),
+              '_sync_state': row['sync_state'],
+            })
         .toList();
   }
 
-  Future<void> cacheDeck(String ownerId, String profileId,
-      Map<String, dynamic> deck, List<Map<String, dynamic>> cards) async {
+  Future<void> saveProfile(String ownerId, Map<String, dynamic> profile) async {
     final db = await database;
+    final id = profile['id'].toString();
+    if (id.isEmpty || profile['caregiver_id']?.toString() != ownerId) {
+      throw StateError(
+          'Profile ownership does not match the signed-in caregiver.');
+    }
+    final now = DateTime.now().toUtc().toIso8601String();
     await db.transaction((txn) async {
+      final current = await txn.query('profiles',
+          where: 'caregiver_id = ? AND id = ?',
+          whereArgs: [ownerId, id],
+          limit: 1);
+      final wasLocalCreate = current.isEmpty ||
+          current.first['sync_state'] == 'pending_create' ||
+          current.first['sync_state'] == 'local_only';
+      final base = current.isEmpty
+          ? null
+          : current.first['base_payload'] ?? current.first['payload'];
       await txn.insert(
-          'decks',
+          'profiles',
           {
             'caregiver_id': ownerId,
-            'id': deck['id'].toString(),
-            'profile_id': profileId,
-            'payload': jsonEncode(deck),
-            'cached_at': DateTime.now().toUtc().toIso8601String()
+            'id': id,
+            'payload': jsonEncode(profile),
+            'base_payload': base,
+            'sync_state': wasLocalCreate ? 'pending_create' : 'pending_update',
+            'deleted_at': null,
+            'cached_at': now,
           },
           conflictAlgorithm: ConflictAlgorithm.replace);
-      await txn.delete('cards',
+      await _queueEntity(txn, 'profile', id, ownerId, 'upsert');
+    });
+  }
+
+  Future<void> deleteProfile(String ownerId, String profileId) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final row = await txn.query('profiles',
+          where: 'caregiver_id = ? AND id = ?',
+          whereArgs: [ownerId, profileId],
+          limit: 1);
+      if (row.isEmpty) return;
+      final decks = await txn.query('decks',
+          columns: ['id'],
+          where: 'caregiver_id = ? AND profile_id = ? AND deleted_at IS NULL',
+          whereArgs: [ownerId, profileId]);
+      final now = DateTime.now().toUtc().toIso8601String();
+      for (final deck in decks) {
+        final deckId = deck['id'].toString();
+        final cards = await txn.query('cards',
+            columns: ['id'],
+            where: 'caregiver_id = ? AND deck_id = ? AND deleted_at IS NULL',
+            whereArgs: [ownerId, deckId]);
+        for (final card in cards) {
+          final cardId = card['id'].toString();
+          await txn.update(
+              'cards', {'sync_state': 'pending_delete', 'deleted_at': now},
+              where: 'caregiver_id = ? AND id = ?',
+              whereArgs: [ownerId, cardId]);
+          await _queueEntity(txn, 'card', cardId, ownerId, 'delete');
+        }
+        await txn.update(
+            'decks', {'sync_state': 'pending_delete', 'deleted_at': now},
+            where: 'caregiver_id = ? AND id = ?', whereArgs: [ownerId, deckId]);
+        await _queueEntity(txn, 'deck', deckId, ownerId, 'delete');
+      }
+      await txn.update(
+          'profiles',
+          {
+            'sync_state': 'pending_delete',
+            'deleted_at': now,
+          },
+          where: 'caregiver_id = ? AND id = ?',
+          whereArgs: [ownerId, profileId]);
+      await _queueEntity(txn, 'profile', profileId, ownerId, 'delete');
+    });
+  }
+
+  Future<Map<String, Object?>?> syncEntity(
+      String ownerId, String type, String id) async {
+    final table = _tableForEntity(type);
+    final identityColumn = type == 'media'
+        ? 'asset_id'
+        : type == 'caregiver'
+            ? 'caregiver_id'
+            : 'id';
+    final rows = await (await database).query(table,
+        where: 'caregiver_id = ? AND $identityColumn = ?',
+        whereArgs: [ownerId, id],
+        limit: 1);
+    if (rows.isEmpty) return null;
+    final row = Map<String, Object?>.from(rows.first);
+    if (type == 'media') {
+      row['sync_revision'] = jsonEncode([
+        row['local_path'],
+        row['file_size'],
+        row['storage_path'],
+        row['mime_type']
+      ]);
+      row['decoded_payload'] = {
+        'id': row['asset_id'],
+        'elderly_profile_id': row['profile_id'],
+        'uploaded_by_caregiver_id': ownerId,
+        'storage_bucket': row['storage_bucket'],
+        'storage_path': row['storage_path'],
+        'media_type': row['media_type'],
+        'mime_type': row['mime_type'],
+      };
+      row['decoded_base_payload'] = null;
+    } else {
+      row['sync_revision'] = row['payload'];
+      row['decoded_payload'] =
+          jsonDecode(row['payload']! as String) as Map<String, dynamic>;
+      row['decoded_base_payload'] = row['base_payload'] == null
+          ? null
+          : jsonDecode(row['base_payload']! as String) as Map<String, dynamic>;
+    }
+    return row;
+  }
+
+  Future<void> markEntitySynced(
+      String ownerId, String type, String id, String operation,
+      {String? expectedRevision}) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final table = _tableForEntity(type);
+      final identity = type == 'media'
+          ? 'asset_id'
+          : type == 'caregiver'
+              ? 'caregiver_id'
+              : 'id';
+      if (operation == 'delete') {
+        final current = await txn.query(table,
+            where: 'caregiver_id = ? AND $identity = ?',
+            whereArgs: [ownerId, id],
+            limit: 1);
+        if (current.isEmpty) return;
+        final revision = type == 'media'
+            ? jsonEncode([
+                current.first['local_path'],
+                current.first['file_size'],
+                current.first['storage_path'],
+                current.first['mime_type']
+              ])
+            : current.first['payload'] as String;
+        if (expectedRevision != null && revision != expectedRevision) {
+          if (type == 'media') {
+            await txn.update(
+                'media_files', {'upload_state': 'pending', 'last_error': null},
+                where: 'caregiver_id = ? AND asset_id = ?',
+                whereArgs: [ownerId, id]);
+          } else {
+            await txn.update(
+                table,
+                {
+                  'sync_state': 'pending_create',
+                  'base_payload': null,
+                  if (type != 'caregiver') 'deleted_at': null,
+                },
+                where: 'caregiver_id = ? AND $identity = ?',
+                whereArgs: [ownerId, id]);
+          }
+          await txn.update(
+              'sync_outbox',
+              {
+                'operation': type == 'media' ? 'upload' : 'upsert',
+                'state': 'pending',
+                'last_error': null,
+                'next_retry_at': null,
+                'updated_at': DateTime.now().toUtc().toIso8601String(),
+              },
+              where: 'caregiver_id = ? AND entity_type = ? AND entity_id = ?',
+              whereArgs: [ownerId, type, id]);
+          return;
+        }
+        await txn.delete(table,
+            where: 'caregiver_id = ? AND $identity = ?',
+            whereArgs: [ownerId, id]);
+      } else if (type == 'media') {
+        final current = await txn.query('media_files',
+            columns: ['local_path', 'file_size', 'storage_path'],
+            where: 'caregiver_id = ? AND asset_id = ?',
+            whereArgs: [ownerId, id],
+            limit: 1);
+        if (current.isEmpty) return;
+        final revision = jsonEncode([
+          current.first['local_path'],
+          current.first['file_size'],
+          current.first['storage_path'],
+          current.first['mime_type']
+        ]);
+        if (expectedRevision != null && revision != expectedRevision) {
+          await txn.update(
+              'media_files',
+              {
+                'upload_state': 'pending',
+                'last_error': null,
+              },
+              where: 'caregiver_id = ? AND asset_id = ?',
+              whereArgs: [ownerId, id]);
+          await txn.update(
+              'sync_outbox',
+              {
+                'operation': 'upload',
+                'state': 'pending',
+                'last_error': null,
+                'next_retry_at': null,
+                'updated_at': DateTime.now().toUtc().toIso8601String(),
+              },
+              where: 'caregiver_id = ? AND entity_type = ? AND entity_id = ?',
+              whereArgs: [ownerId, type, id]);
+          return;
+        }
+        await txn.update(
+            'media_files', {'upload_state': 'uploaded', 'last_error': null},
+            where: 'caregiver_id = ? AND asset_id = ?',
+            whereArgs: [ownerId, id]);
+      } else {
+        final rows = await txn.query(table,
+            columns: ['payload'],
+            where: 'caregiver_id = ? AND $identity = ?',
+            whereArgs: [ownerId, id],
+            limit: 1);
+        if (rows.isNotEmpty) {
+          final currentPayload = rows.first['payload'] as String;
+          if (expectedRevision != null && currentPayload != expectedRevision) {
+            await txn.update(
+                table,
+                {
+                  'sync_state': 'pending_update',
+                  'base_payload': expectedRevision,
+                  if (type != 'caregiver') 'deleted_at': null,
+                },
+                where: 'caregiver_id = ? AND $identity = ?',
+                whereArgs: [ownerId, id]);
+            await txn.update(
+                'sync_outbox',
+                {
+                  'operation': 'upsert',
+                  'state': 'pending',
+                  'last_error': null,
+                  'next_retry_at': null,
+                  'updated_at': DateTime.now().toUtc().toIso8601String(),
+                },
+                where: 'caregiver_id = ? AND entity_type = ? AND entity_id = ?',
+                whereArgs: [ownerId, type, id]);
+            return;
+          }
+          await txn.update(
+              table,
+              {
+                'sync_state': 'synced',
+                'base_payload': rows.first['payload'],
+                if (type == 'card')
+                  'cached_at': DateTime.now().toUtc().toIso8601String(),
+                if (type != 'caregiver') 'deleted_at': null,
+              },
+              where: 'caregiver_id = ? AND $identity = ?',
+              whereArgs: [ownerId, id]);
+        }
+      }
+      await txn.update(
+          'sync_outbox',
+          {
+            'state': 'synced',
+            'last_error': null,
+            'next_retry_at': null,
+            'updated_at': DateTime.now().toUtc().toIso8601String(),
+          },
+          where: 'caregiver_id = ? AND entity_type = ? AND entity_id = ?',
+          whereArgs: [ownerId, type, id]);
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> conflicts(String ownerId) async =>
+      (await (await database).query('sync_conflicts',
+              where: 'caregiver_id = ?', whereArgs: [ownerId]))
+          .map((row) => {
+                ...row,
+                'local_payload': jsonDecode(row['local_payload']! as String),
+                'remote_payload': jsonDecode(row['remote_payload']! as String),
+              })
+          .toList();
+
+  Future<void> resolveConflict(String ownerId, String type, String id,
+      {required bool keepLocal}) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final rows = await txn.query('sync_conflicts',
+          where: 'caregiver_id = ? AND entity_type = ? AND entity_id = ?',
+          whereArgs: [ownerId, type, id],
+          limit: 1);
+      if (rows.isEmpty) return;
+      final conflict = rows.first;
+      final remote = Map<String, dynamic>.from(
+          jsonDecode(conflict['remote_payload']! as String) as Map);
+      final operation =
+          keepLocal ? conflict['operation']!.toString() : 'upsert';
+      final table = _tableForEntity(type);
+      if (type == 'media') {
+        if (!keepLocal) {
+          await txn.update(
+              'media_files',
+              {
+                'storage_bucket': remote['storage_bucket'],
+                'storage_path': remote['storage_path'],
+                'upload_state': 'uploaded',
+                'last_error': null,
+              },
+              where: 'caregiver_id = ? AND asset_id = ?',
+              whereArgs: [ownerId, id]);
+        }
+      } else if (keepLocal) {
+        final remoteDeleted = remote['_remote_deleted'] == true;
+        final identity = type == 'caregiver' ? 'caregiver_id' : 'id';
+        await txn.update(
+            table,
+            {
+              'base_payload': remoteDeleted ? null : jsonEncode(remote),
+              'sync_state': operation == 'delete'
+                  ? 'pending_delete'
+                  : remoteDeleted
+                      ? 'pending_create'
+                      : 'pending_update',
+              if (type != 'caregiver')
+                'deleted_at': operation == 'delete'
+                    ? DateTime.now().toUtc().toIso8601String()
+                    : null,
+            },
+            where: 'caregiver_id = ? AND $identity = ?',
+            whereArgs: [ownerId, id]);
+      } else if (remote['_remote_deleted'] == true) {
+        final identity = type == 'caregiver' ? 'caregiver_id' : 'id';
+        await txn.update(
+            table,
+            {
+              'sync_state': 'synced',
+              if (type != 'caregiver')
+                'deleted_at': DateTime.now().toUtc().toIso8601String(),
+            },
+            where: 'caregiver_id = ? AND $identity = ?',
+            whereArgs: [ownerId, id]);
+      } else {
+        final payload = jsonEncode(remote);
+        final identity = type == 'caregiver' ? 'caregiver_id' : 'id';
+        await txn.update(
+            table,
+            {
+              'payload': payload,
+              'base_payload': payload,
+              'sync_state': 'synced',
+              if (type != 'caregiver') 'deleted_at': null,
+              'cached_at': DateTime.now().toUtc().toIso8601String(),
+            },
+            where: 'caregiver_id = ? AND $identity = ?',
+            whereArgs: [ownerId, id]);
+      }
+      if (keepLocal) {
+        await txn.update(
+            'sync_outbox',
+            {
+              'operation': operation,
+              'state': 'pending',
+              'attempts': 0,
+              'next_retry_at': null,
+              'last_error': null,
+              'updated_at': DateTime.now().toUtc().toIso8601String(),
+            },
+            where: 'caregiver_id = ? AND entity_type = ? AND entity_id = ?',
+            whereArgs: [ownerId, type, id]);
+      } else {
+        await txn.update('sync_outbox',
+            {'state': 'synced', 'last_error': null, 'next_retry_at': null},
+            where: 'caregiver_id = ? AND entity_type = ? AND entity_id = ?',
+            whereArgs: [ownerId, type, id]);
+      }
+      await txn.delete('sync_conflicts',
+          where: 'caregiver_id = ? AND entity_type = ? AND entity_id = ?',
+          whereArgs: [ownerId, type, id]);
+    });
+  }
+
+  Future<void> recordConflict(
+      String ownerId,
+      String type,
+      String id,
+      String operation,
+      Map<String, dynamic> local,
+      Map<String, dynamic> remote) async {
+    final db = await database;
+    final now = DateTime.now().toUtc().toIso8601String();
+    await db.transaction((txn) async {
+      await txn.insert(
+          'sync_conflicts',
+          {
+            'caregiver_id': ownerId,
+            'entity_type': type,
+            'entity_id': id,
+            'operation': operation,
+            'local_payload': jsonEncode(local),
+            'remote_payload': jsonEncode(remote),
+            'created_at': now,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      if (type == 'media') {
+        await txn.update(
+            'media_files',
+            {
+              'upload_state': 'conflict',
+              'last_error': 'Review the conflicting cloud media record.'
+            },
+            where: 'caregiver_id = ? AND asset_id = ?',
+            whereArgs: [ownerId, id]);
+      } else {
+        final identity = type == 'caregiver' ? 'caregiver_id' : 'id';
+        await txn.update(_tableForEntity(type), {'sync_state': 'conflict'},
+            where: 'caregiver_id = ? AND $identity = ?',
+            whereArgs: [ownerId, id]);
+      }
+      await txn.update(
+          'sync_outbox',
+          {
+            'state': 'conflict',
+            'last_error': 'A newer cloud version needs review.',
+            'updated_at': now
+          },
+          where: 'caregiver_id = ? AND entity_type = ? AND entity_id = ?',
+          whereArgs: [ownerId, type, id]);
+    });
+  }
+
+  Future<void> cacheDeck(String ownerId, String profileId,
+      Map<String, dynamic> deck, List<Map<String, dynamic>> cards,
+      {DateTime? remoteSnapshotStartedAt}) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final deckId = deck['id'].toString();
+      final now = DateTime.now().toUtc().toIso8601String();
+      final existingDeck = await txn.query('decks',
+          where: 'caregiver_id = ? AND id = ?',
+          whereArgs: [ownerId, deckId],
+          limit: 1);
+      if (existingDeck.isEmpty ||
+          existingDeck.first['sync_state'] == 'synced') {
+        final payload = jsonEncode(deck);
+        final values = {
+          'profile_id': profileId,
+          'payload': payload,
+          'base_payload': payload,
+          'sync_state': 'synced',
+          'deleted_at': null,
+          'cached_at': now
+        };
+        if (existingDeck.isEmpty) {
+          await txn.insert('decks', {
+            'caregiver_id': ownerId,
+            'id': deckId,
+            ...values,
+          });
+        } else {
+          // INSERT OR REPLACE deletes the parent row first. With foreign keys
+          // enabled that cascades and removes every locally cached card.
+          await txn.update('decks', values,
+              where: 'caregiver_id = ? AND id = ?',
+              whereArgs: [ownerId, deckId]);
+        }
+      }
+      final existingCards = await txn.query('cards',
           where: 'caregiver_id = ? AND deck_id = ?',
-          whereArgs: [ownerId, deck['id'].toString()]);
+          whereArgs: [ownerId, deckId]);
+      final remoteIds = {for (final card in cards) card['id'].toString()};
+      for (final old in existingCards) {
+        final cachedAt =
+            DateTime.tryParse(old['cached_at']?.toString() ?? '')?.toUtc();
+        final snapshotStartedAt = remoteSnapshotStartedAt?.toUtc();
+        if (old['sync_state'] == 'synced' &&
+            !remoteIds.contains(old['id'].toString()) &&
+            cachedAt != null &&
+            snapshotStartedAt != null &&
+            cachedAt.isBefore(snapshotStartedAt)) {
+          await txn.delete('cards',
+              where: 'caregiver_id = ? AND id = ?',
+              whereArgs: [ownerId, old['id']]);
+        }
+      }
       for (final card in cards) {
+        final cardId = card['id'].toString();
+        final existing =
+            existingCards.where((item) => item['id'] == cardId).firstOrNull;
+        if (existing != null && existing['sync_state'] != 'synced') continue;
+        final payload = jsonEncode(card);
         await txn.insert(
             'cards',
             {
               'caregiver_id': ownerId,
-              'id': card['id'].toString(),
-              'deck_id': deck['id'].toString(),
-              'payload': jsonEncode(card),
-              'cached_at': DateTime.now().toUtc().toIso8601String()
+              'id': cardId,
+              'deck_id': deckId,
+              'payload': payload,
+              'base_payload': payload,
+              'sync_state': 'synced',
+              'deleted_at': null,
+              'cached_at': now
             },
             conflictAlgorithm: ConflictAlgorithm.replace);
       }
@@ -300,9 +885,21 @@ class OfflineStore {
           String ownerId, String profileId, Map<String, dynamic> deck) async =>
       (await database).transaction((txn) async {
         final id = deck['id'].toString();
+        final existing = await txn.query('decks',
+            columns: ['sync_state'],
+            where: 'caregiver_id = ? AND id = ?',
+            whereArgs: [ownerId, id],
+            limit: 1);
+        if (existing.isNotEmpty && existing.first['sync_state'] != 'synced') {
+          return;
+        }
+        final payload = jsonEncode(deck);
         final values = {
           'profile_id': profileId,
-          'payload': jsonEncode(deck),
+          'payload': payload,
+          'base_payload': payload,
+          'sync_state': 'synced',
+          'deleted_at': null,
           'cached_at': DateTime.now().toUtc().toIso8601String()
         };
         final updated = await txn.update('decks', values,
@@ -319,13 +916,14 @@ class OfflineStore {
   Future<List<Map<String, dynamic>>> readDecks(
       String ownerId, String profileId) async {
     final rows = await (await database).query('decks',
-        where: 'caregiver_id = ? AND profile_id = ?',
+        where: 'caregiver_id = ? AND profile_id = ? AND deleted_at IS NULL',
         whereArgs: [ownerId, profileId],
         orderBy: 'cached_at DESC');
     final result = <Map<String, dynamic>>[];
     for (final row in rows) {
       final deck = Map<String, dynamic>.from(
           jsonDecode(row['payload']! as String) as Map);
+      deck['_sync_state'] = row['sync_state'];
       final state = await (await database).query('cache_manifest',
           columns: ['state', 'error'],
           where: 'caregiver_id = ? AND item_type = ? AND item_id = ?',
@@ -341,21 +939,197 @@ class OfflineStore {
 
   Future<List<Map<String, dynamic>>> readCards(
       String ownerId, String deckId) async {
-    final rows = await (await database).query('cards',
-        where: 'caregiver_id = ? AND deck_id = ?',
+    final db = await database;
+    final rows = await db.query('cards',
+        where: 'caregiver_id = ? AND deck_id = ? AND deleted_at IS NULL',
         whereArgs: [ownerId, deckId]);
-    final cards = rows
-        .map((row) => Map<String, dynamic>.from(
-            jsonDecode(row['payload']! as String) as Map))
-        .toList();
+    final cards = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      final card = Map<String, dynamic>.from(
+          jsonDecode(row['payload']! as String) as Map);
+      card['_sync_state'] = row['sync_state'];
+      cards.add(card);
+    }
     cards.sort((a, b) => ((a['display_order'] as num?)?.toInt() ?? 0)
         .compareTo((b['display_order'] as num?)?.toInt() ?? 0));
     return cards;
   }
 
+  Future<void> saveDeckLocal(
+      String ownerId, String profileId, Map<String, dynamic> deck) async {
+    final db = await database;
+    final id = deck['id'].toString();
+    if (id.isEmpty ||
+        deck['elderly_profile_id']?.toString() != profileId ||
+        deck['created_by_caregiver_id']?.toString() != ownerId) {
+      throw StateError('Deck ownership does not match the selected profile.');
+    }
+    await db.transaction((txn) async {
+      final profile = await txn.query('profiles',
+          columns: ['id'],
+          where: 'caregiver_id = ? AND id = ? AND deleted_at IS NULL',
+          whereArgs: [ownerId, profileId],
+          limit: 1);
+      if (profile.isEmpty) {
+        throw StateError(
+            'The selected profile is not saved for this caregiver.');
+      }
+      final rows = await txn.query('decks',
+          where: 'caregiver_id = ? AND id = ?',
+          whereArgs: [ownerId, id],
+          limit: 1);
+      final create = rows.isEmpty ||
+          rows.first['sync_state'] == 'pending_create' ||
+          rows.first['sync_state'] == 'local_only';
+      final base = rows.isEmpty
+          ? null
+          : rows.first['base_payload'] ?? rows.first['payload'];
+      await txn.insert(
+          'decks',
+          {
+            'caregiver_id': ownerId,
+            'id': id,
+            'profile_id': profileId,
+            'payload': jsonEncode(deck),
+            'base_payload': base,
+            'sync_state': create ? 'pending_create' : 'pending_update',
+            'deleted_at': null,
+            'cached_at': DateTime.now().toUtc().toIso8601String(),
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      await _queueEntity(txn, 'deck', id, ownerId, 'upsert');
+    });
+  }
+
+  Future<void> deleteDeckLocal(String ownerId, String deckId) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final now = DateTime.now().toUtc().toIso8601String();
+      final children = await txn.query('cards',
+          columns: ['id'],
+          where: 'caregiver_id = ? AND deck_id = ?',
+          whereArgs: [ownerId, deckId]);
+      for (final card in children) {
+        final id = card['id'].toString();
+        await txn.update(
+            'cards', {'sync_state': 'pending_delete', 'deleted_at': now},
+            where: 'caregiver_id = ? AND id = ?', whereArgs: [ownerId, id]);
+        await _queueEntity(txn, 'card', id, ownerId, 'delete');
+      }
+      await txn.update(
+          'decks', {'sync_state': 'pending_delete', 'deleted_at': now},
+          where: 'caregiver_id = ? AND id = ?', whereArgs: [ownerId, deckId]);
+      await _queueEntity(txn, 'deck', deckId, ownerId, 'delete');
+    });
+  }
+
+  Future<void> saveCardLocal(
+      String ownerId, String deckId, Map<String, dynamic> card) async {
+    final db = await database;
+    final id = card['id']?.toString() ?? '';
+    if (id.isEmpty || card['deck_id']?.toString() != deckId) {
+      throw StateError('The card ID and deck relationship are invalid.');
+    }
+    await db.transaction((txn) async {
+      final deck = await txn.query('decks',
+          where: 'caregiver_id = ? AND id = ? AND deleted_at IS NULL',
+          whereArgs: [ownerId, deckId],
+          limit: 1);
+      if (deck.isEmpty) throw StateError('The local deck is unavailable.');
+      final rows = await txn.query('cards',
+          where: 'caregiver_id = ? AND id = ?',
+          whereArgs: [ownerId, id],
+          limit: 1);
+      final create = rows.isEmpty ||
+          rows.first['sync_state'] == 'pending_create' ||
+          rows.first['sync_state'] == 'local_only';
+      final base = rows.isEmpty
+          ? null
+          : rows.first['base_payload'] ?? rows.first['payload'];
+      await txn.insert(
+          'cards',
+          {
+            'caregiver_id': ownerId,
+            'id': id,
+            'deck_id': deckId,
+            'payload': jsonEncode(card),
+            'base_payload': base,
+            'sync_state': create ? 'pending_create' : 'pending_update',
+            'deleted_at': null,
+            'cached_at': DateTime.now().toUtc().toIso8601String(),
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      await _queueEntity(txn, 'card', id, ownerId, 'upsert');
+    });
+  }
+
+  Future<void> reorderCardsLocal(
+      String ownerId, String deckId, List<String> orderedCardIds) async {
+    if (orderedCardIds.toSet().length != orderedCardIds.length) {
+      throw ArgumentError('A card can appear only once in a deck order.');
+    }
+    final db = await database;
+    await db.transaction((txn) async {
+      final deck = await txn.query('decks',
+          columns: ['id'],
+          where: 'caregiver_id = ? AND id = ? AND deleted_at IS NULL',
+          whereArgs: [ownerId, deckId],
+          limit: 1);
+      if (deck.isEmpty) throw StateError('The local deck is unavailable.');
+      final existing = await txn.query('cards',
+          where: 'caregiver_id = ? AND deck_id = ? AND deleted_at IS NULL',
+          whereArgs: [ownerId, deckId]);
+      final byId = {for (final row in existing) row['id'].toString(): row};
+      if (byId.length != orderedCardIds.length ||
+          !byId.keys.toSet().containsAll(orderedCardIds)) {
+        throw StateError(
+            'The card order does not match the saved cards in this deck.');
+      }
+      for (var index = 0; index < orderedCardIds.length; index++) {
+        final id = orderedCardIds[index];
+        final row = byId[id]!;
+        final payload = Map<String, dynamic>.from(
+            jsonDecode(row['payload']! as String) as Map);
+        payload['display_order'] = index;
+        final state = row['sync_state']?.toString();
+        await txn.update(
+            'cards',
+            {
+              'payload': jsonEncode(payload),
+              'base_payload': row['base_payload'] ?? row['payload'],
+              'sync_state': state == 'pending_create' || state == 'local_only'
+                  ? 'pending_create'
+                  : 'pending_update',
+              'cached_at': DateTime.now().toUtc().toIso8601String(),
+            },
+            where: 'caregiver_id = ? AND id = ?',
+            whereArgs: [ownerId, id]);
+        await _queueEntity(txn, 'card', id, ownerId, 'upsert');
+      }
+    });
+  }
+
+  Future<void> deleteCardLocal(String ownerId, String cardId) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.update(
+          'cards',
+          {
+            'sync_state': 'pending_delete',
+            'deleted_at': DateTime.now().toUtc().toIso8601String(),
+          },
+          where: 'caregiver_id = ? AND id = ?',
+          whereArgs: [ownerId, cardId]);
+      await _queueEntity(txn, 'card', cardId, ownerId, 'delete');
+    });
+  }
+
   Future<String> cacheMedia(
       String ownerId, String assetId, List<int> bytes, String? mimeType,
-      {String? extension, int? expectedBytes, String? rootPath}) async {
+      {String? extension,
+      int? expectedBytes,
+      String? rootPath,
+      String uploadState = 'cached'}) async {
     if (bytes.isEmpty ||
         (expectedBytes != null && bytes.length != expectedBytes)) {
       throw StateError('Downloaded media failed local verification.');
@@ -399,7 +1173,9 @@ class OfflineStore {
                 'caregiver_id': ownerId,
                 'asset_id': assetId,
                 'local_path': file.path,
-                'mime_type': mimeType
+                'mime_type': mimeType,
+                'file_size': existingLength,
+                'upload_state': uploadState,
               },
               conflictAlgorithm: ConflictAlgorithm.replace);
           return file.path;
@@ -429,7 +1205,9 @@ class OfflineStore {
           'caregiver_id': ownerId,
           'asset_id': assetId,
           'local_path': file.path,
-          'mime_type': mimeType
+          'mime_type': mimeType,
+          'file_size': bytes.length,
+          'upload_state': uploadState,
         },
         conflictAlgorithm: ConflictAlgorithm.replace);
     return file.path;
@@ -451,6 +1229,108 @@ class OfflineStore {
       return null;
     }
     return path;
+  }
+
+  Future<Map<String, Object?>?> mediaRecord(
+      String ownerId, String assetId) async {
+    final rows = await (await database).query('media_files',
+        where: 'caregiver_id = ? AND asset_id = ?',
+        whereArgs: [ownerId, assetId],
+        limit: 1);
+    return rows.isEmpty ? null : Map<String, Object?>.from(rows.first);
+  }
+
+  /// Copies a picker/recorder file into durable app-private storage and queues
+  /// its upload in the same SQLite transaction as its metadata.
+  Future<String> importLocalMedia({
+    required String ownerId,
+    required String assetId,
+    required String profileId,
+    required String mediaType,
+    required String mimeType,
+    required File source,
+    String? deckId,
+    String? cardId,
+    String bucket = 'kincare-media',
+    String? rootPath,
+  }) async {
+    if (!await source.exists())
+      throw StateError('The selected media is missing.');
+    final sourceLength = await source.length();
+    if (sourceLength <= 0) throw StateError('The selected media is empty.');
+    final root = rootPath == null
+        ? await getApplicationSupportDirectory()
+        : Directory(rootPath);
+    final extension =
+        source.path.split('.').last.replaceAll(RegExp(r'[^A-Za-z0-9]'), '');
+    final directory = Directory(
+        '${root.path}${Platform.pathSeparator}media${Platform.pathSeparator}$ownerId');
+    await directory.create(recursive: true);
+    final destination = File(
+        '${directory.path}${Platform.pathSeparator}$assetId.${extension.isEmpty ? 'bin' : extension}');
+    final temporary = File(
+        '${destination.path}.part-${DateTime.now().microsecondsSinceEpoch}');
+    try {
+      await source.copy(temporary.path);
+      if (await temporary.length() != sourceLength) {
+        throw StateError('The selected media could not be copied completely.');
+      }
+      if (await destination.exists()) await destination.delete();
+      await temporary.rename(destination.path);
+    } finally {
+      if (await temporary.exists()) await temporary.delete();
+    }
+    final storagePath =
+        '$profileId/$assetId.${extension.isEmpty ? 'bin' : extension}';
+    final db = await database;
+    try {
+      await db.transaction((txn) async {
+        final profile = await txn.query('profiles',
+            columns: ['id'],
+            where: 'caregiver_id = ? AND id = ? AND deleted_at IS NULL',
+            whereArgs: [ownerId, profileId],
+            limit: 1);
+        if (profile.isEmpty) {
+          throw StateError(
+              'The media profile is not saved for this caregiver.');
+        }
+        if (deckId != null) {
+          final deck = await txn.query('decks',
+              columns: ['id'],
+              where:
+                  'caregiver_id = ? AND id = ? AND profile_id = ? AND deleted_at IS NULL',
+              whereArgs: [ownerId, deckId, profileId],
+              limit: 1);
+          if (deck.isEmpty) {
+            throw StateError('The media deck is not saved for this caregiver.');
+          }
+        }
+        await txn.insert(
+            'media_files',
+            {
+              'caregiver_id': ownerId,
+              'asset_id': assetId,
+              'local_path': destination.path,
+              'mime_type': mimeType,
+              'profile_id': profileId,
+              'deck_id': deckId,
+              'card_id': cardId,
+              'media_type': mediaType,
+              'storage_bucket': bucket,
+              'storage_path': storagePath,
+              'file_size': sourceLength,
+              'upload_state': 'pending',
+              'upload_attempts': 0,
+              'last_error': null,
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace);
+        await _queueEntity(txn, 'media', assetId, ownerId, 'upload');
+      });
+    } catch (_) {
+      // Keep the durable source file. The user can retry or recover the draft.
+      rethrow;
+    }
+    return destination.path;
   }
 
   Future<bool> allMediaCached(String ownerId, List<String> assetIds) async {
@@ -554,6 +1434,7 @@ class OfflineStore {
               'is_correct': value['is_correct'] == null
                   ? null
                   : (value['is_correct'] == true ? 1 : 0),
+              'response_audio_asset_id': value['response_audio_asset_id'],
               'responded_at': value['responded_at'] ??
                   DateTime.now().toUtc().toIso8601String()
             },
@@ -591,7 +1472,118 @@ class OfflineStore {
           where: 'id = ?', whereArgs: [id]);
       await _queue(
           txn, id, 'session', id, rows.first['caregiver_id'] as String);
+      if (status != 'in_progress') {
+        await txn.delete('game_checkpoints',
+            where: 'session_id = ?', whereArgs: [id]);
+      }
     });
+  }
+
+  Future<void> completeSessionWithResponses(
+      String sessionId, String caregiverId, List<Map<String, dynamic>> values,
+      {String? completedAt}) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final session = await txn.query('sessions',
+          where: 'id = ? AND caregiver_id = ?',
+          whereArgs: [sessionId, caregiverId],
+          limit: 1);
+      if (session.isEmpty)
+        throw StateError('Activity session was not found locally.');
+      for (final value in values) {
+        final id = value['id'].toString();
+        await txn.insert(
+            'responses',
+            {
+              'id': id,
+              'session_id': sessionId,
+              'caregiver_id': caregiverId,
+              'response_index': value['response_index'] as int,
+              'payload': jsonEncode(value['response_payload']),
+              'is_correct': value['is_correct'] == null
+                  ? null
+                  : (value['is_correct'] == true ? 1 : 0),
+              'response_audio_asset_id': value['response_audio_asset_id'],
+              'responded_at': value['responded_at'] ??
+                  DateTime.now().toUtc().toIso8601String(),
+            },
+            conflictAlgorithm: ConflictAlgorithm.ignore);
+        final exists = await txn.query('responses',
+            columns: ['id'],
+            where: 'id = ? AND session_id = ?',
+            whereArgs: [id, sessionId],
+            limit: 1);
+        if (exists.isEmpty) {
+          throw StateError(
+              'A response ID is already attached to another session.');
+        }
+        await _queue(txn, id, 'response', id, caregiverId);
+      }
+      await txn.update(
+          'sessions',
+          {
+            'status': 'completed',
+            'completed_at':
+                completedAt ?? DateTime.now().toUtc().toIso8601String(),
+          },
+          where: 'id = ? AND caregiver_id = ?',
+          whereArgs: [sessionId, caregiverId]);
+      await _queue(txn, sessionId, 'session', sessionId, caregiverId);
+      await txn.delete('game_checkpoints',
+          where: 'caregiver_id = ? AND session_id = ?',
+          whereArgs: [caregiverId, sessionId]);
+    });
+  }
+
+  Future<void> saveGameCheckpoint({
+    required String caregiverId,
+    required String sessionId,
+    required String gameKey,
+    required Map<String, dynamic> payload,
+  }) async {
+    await (await database).insert(
+        'game_checkpoints',
+        {
+          'caregiver_id': caregiverId,
+          'session_id': sessionId,
+          'game_key': gameKey,
+          'payload': jsonEncode(payload),
+          'updated_at': DateTime.now().toUtc().toIso8601String(),
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<Map<String, dynamic>?> readGameCheckpoint(
+      String caregiverId, String sessionId) async {
+    final rows = await (await database).query('game_checkpoints',
+        where: 'caregiver_id = ? AND session_id = ?',
+        whereArgs: [caregiverId, sessionId],
+        limit: 1);
+    if (rows.isEmpty) return null;
+    return Map<String, dynamic>.from(
+        jsonDecode(rows.first['payload']! as String) as Map);
+  }
+
+  Future<Map<String, Object?>?> resumableSession(
+      String ownerId, String profileId, String activityKey) async {
+    final rows = await (await database).query('sessions',
+        where:
+            'caregiver_id = ? AND profile_id = ? AND activity_key = ? AND status = ?',
+        whereArgs: [ownerId, profileId, activityKey, 'in_progress'],
+        orderBy: 'started_at DESC',
+        limit: 1);
+    return rows.isEmpty ? null : rows.first;
+  }
+
+  Future<Map<String, Object?>?> resumableDeckSession(
+      String ownerId, String profileId, String deckId) async {
+    final rows = await (await database).query('sessions',
+        where:
+            'caregiver_id = ? AND profile_id = ? AND activity_key = ? AND memory_deck_id = ? AND status = ?',
+        whereArgs: [ownerId, profileId, 'memory_decks', deckId, 'in_progress'],
+        orderBy: 'started_at DESC',
+        limit: 1);
+    return rows.isEmpty ? null : rows.first;
   }
 
   Future<List<Map<String, Object?>>> nextOutbox(String ownerId,
@@ -599,10 +1591,19 @@ class OfflineStore {
     final now = DateTime.now().toUtc().toIso8601String();
     return (await database).query('sync_outbox',
         where:
-            'caregiver_id = ? AND state != ? AND (? = 1 OR next_retry_at IS NULL OR next_retry_at <= ?)',
-        whereArgs: [ownerId, 'synced', force ? 1 : 0, now],
-        orderBy:
-            "CASE entity_type WHEN 'session' THEN 0 ELSE 1 END, updated_at ASC");
+            'caregiver_id = ? AND state NOT IN (?, ?) AND (? = 1 OR next_retry_at IS NULL OR next_retry_at <= ?)',
+        whereArgs: [ownerId, 'synced', 'conflict', force ? 1 : 0, now],
+        orderBy: '''
+          CASE WHEN operation = 'delete' THEN 1 ELSE 0 END,
+          CASE
+            WHEN operation = 'delete' THEN CASE entity_type
+              WHEN 'card' THEN 0 WHEN 'deck' THEN 1 WHEN 'profile' THEN 2
+              WHEN 'media' THEN 3 WHEN 'caregiver' THEN 4 WHEN 'response' THEN 5 WHEN 'session' THEN 6 ELSE 7 END
+            ELSE CASE entity_type
+              WHEN 'caregiver' THEN 0 WHEN 'profile' THEN 1 WHEN 'media' THEN 2
+              WHEN 'deck' THEN 3 WHEN 'card' THEN 4 WHEN 'session' THEN 5 WHEN 'response' THEN 6 ELSE 7 END
+          END,
+          updated_at ASC''');
   }
 
   Future<Map<String, Object?>?> readSession(String id) async {
@@ -615,7 +1616,9 @@ class OfflineStore {
       .then((db) => db.query('responses', where: 'id = ?', whereArgs: [id])));
 
   Future<bool> markSynced(String entityType, String entityId,
-      {String? expectedStatus, String? expectedCompletedAt}) async {
+      {String? expectedStatus,
+      String? expectedCompletedAt,
+      String? caregiverId}) async {
     final db = await database;
     var unchanged = true;
     await db.transaction((txn) async {
@@ -636,10 +1639,17 @@ class OfflineStore {
                 'next_retry_at': null,
                 'updated_at': DateTime.now().toUtc().toIso8601String()
               },
-              where: 'entity_id = ? AND entity_type = ?',
-              whereArgs: [entityId, entityType]);
+              where:
+                  'entity_id = ? AND entity_type = ?${caregiverId == null ? '' : ' AND caregiver_id = ?'}',
+              whereArgs: [
+                entityId,
+                entityType,
+                if (caregiverId != null) caregiverId
+              ]);
           await txn.update('sessions', {'sync_state': 'pending'},
-              where: 'id = ?', whereArgs: [entityId]);
+              where:
+                  'id = ?${caregiverId == null ? '' : ' AND caregiver_id = ?'}',
+              whereArgs: [entityId, if (caregiverId != null) caregiverId]);
           return;
         }
       }
@@ -651,24 +1661,34 @@ class OfflineStore {
             'next_retry_at': null,
             'updated_at': DateTime.now().toUtc().toIso8601String()
           },
-          where: 'entity_id = ? AND entity_type = ?',
-          whereArgs: [entityId, entityType]);
+          where:
+              'entity_id = ? AND entity_type = ?${caregiverId == null ? '' : ' AND caregiver_id = ?'}',
+          whereArgs: [
+            entityId,
+            entityType,
+            if (caregiverId != null) caregiverId
+          ]);
       final table = entityType == 'session' ? 'sessions' : 'responses';
-      final column = entityType == 'session' ? 'id' : 'id';
       await txn.update(table, {'sync_state': 'synced'},
-          where: '$column = ?', whereArgs: [entityId]);
+          where: 'id = ?${caregiverId == null ? '' : ' AND caregiver_id = ?'}',
+          whereArgs: [entityId, if (caregiverId != null) caregiverId]);
     });
     return unchanged;
   }
 
-  Future<void> markFailed(
-      String entityType, String entityId, String error) async {
+  Future<void> markFailed(String entityType, String entityId, String error,
+      {String? caregiverId}) async {
     final db = await database;
     await db.transaction((txn) async {
       final rows = await txn.query('sync_outbox',
           columns: ['attempts'],
-          where: 'entity_id = ? AND entity_type = ?',
-          whereArgs: [entityId, entityType],
+          where:
+              'entity_id = ? AND entity_type = ?${caregiverId == null ? '' : ' AND caregiver_id = ?'}',
+          whereArgs: [
+            entityId,
+            entityType,
+            if (caregiverId != null) caregiverId
+          ],
           limit: 1);
       if (rows.isEmpty) return;
       final attempts = (rows.first['attempts'] as int) + 1;
@@ -685,11 +1705,33 @@ class OfflineStore {
                 .toIso8601String(),
             'updated_at': DateTime.now().toUtc().toIso8601String()
           },
-          where: 'entity_id = ? AND entity_type = ?',
-          whereArgs: [entityId, entityType]);
-      await txn.update(entityType == 'session' ? 'sessions' : 'responses',
-          {'sync_state': 'failed'},
-          where: 'id = ?', whereArgs: [entityId]);
+          where:
+              'entity_id = ? AND entity_type = ?${caregiverId == null ? '' : ' AND caregiver_id = ?'}',
+          whereArgs: [
+            entityId,
+            entityType,
+            if (caregiverId != null) caregiverId
+          ]);
+      if (entityType == 'session' || entityType == 'response') {
+        await txn.update(entityType == 'session' ? 'sessions' : 'responses',
+            {'sync_state': 'failed'},
+            where: 'id = ?', whereArgs: [entityId]);
+      } else if (entityType == 'media') {
+        await txn.update(
+            'media_files',
+            {
+              'upload_state': 'failed',
+              'last_error': error,
+              'upload_attempts': (rows.first['attempts'] as int) + 1
+            },
+            where: 'asset_id = ? AND caregiver_id = ?',
+            whereArgs: [entityId, caregiverId]);
+      } else {
+        final identity = entityType == 'caregiver' ? 'caregiver_id' : 'id';
+        await txn.update(_tableForEntity(entityType), {'sync_state': 'failed'},
+            where: '$identity = ? AND caregiver_id = ?',
+            whereArgs: [entityId, caregiverId]);
+      }
     });
   }
 
@@ -730,13 +1772,6 @@ class OfflineStore {
     final db = await database;
     final cachedMediaPaths = <String>[];
     await db.transaction((txn) async {
-      final media = await txn.query('media_files',
-          columns: ['local_path'],
-          where: 'caregiver_id = ?',
-          whereArgs: [ownerId]);
-      cachedMediaPaths.addAll(media
-          .map((row) => row['local_path'] as String)
-          .where((path) => path.isNotEmpty));
       final pending = await txn.query('sync_outbox',
           columns: ['entity_type', 'entity_id'],
           where: 'caregiver_id = ? AND state != ?',
@@ -771,22 +1806,44 @@ class OfflineStore {
       await txn.delete('sync_outbox',
           where: 'caregiver_id = ? AND state = ?',
           whereArgs: [ownerId, 'synced']);
-      for (final table in [
-        'profiles',
-        'decks',
-        'cards',
-        'media_files',
-        'devices'
-      ]) {
-        await txn
-            .delete(table, where: 'caregiver_id = ?', whereArgs: [ownerId]);
+      final hasPendingContent = pending.any((item) => const {
+            'caregiver',
+            'profile',
+            'deck',
+            'card',
+            'media'
+          }.contains(item['entity_type']));
+      if (!hasPendingContent) {
+        final media = await txn.query('media_files',
+            columns: ['local_path'],
+            where: 'caregiver_id = ?',
+            whereArgs: [ownerId]);
+        cachedMediaPaths.addAll(media
+            .map((row) => row['local_path'] as String)
+            .where((path) => path.isNotEmpty));
+        // Keep the local authoring graph intact whenever queued work depends on
+        // it. A later sign-in by this same caregiver can safely resume sync.
+        await txn.delete('cards',
+            where: 'caregiver_id = ? AND sync_state = ?',
+            whereArgs: [ownerId, 'synced']);
+        await txn.delete('decks',
+            where: 'caregiver_id = ? AND sync_state = ?',
+            whereArgs: [ownerId, 'synced']);
+        await txn.delete('profiles',
+            where: 'caregiver_id = ? AND sync_state = ?',
+            whereArgs: [ownerId, 'synced']);
+        await txn.delete('media_files',
+            where: 'caregiver_id = ?', whereArgs: [ownerId]);
       }
-      for (final table in [
-        'caregiver_cache',
+      await txn
+          .delete('devices', where: 'caregiver_id = ?', whereArgs: [ownerId]);
+      final cacheTables = [
         'cached_activity_sessions',
         'cached_activity_responses',
         'cache_manifest'
-      ]) {
+      ];
+      if (!hasPendingContent) cacheTables.add('caregiver_cache');
+      for (final table in cacheTables) {
         await txn
             .delete(table, where: 'caregiver_id = ?', whereArgs: [ownerId]);
       }
@@ -808,6 +1865,33 @@ class OfflineStore {
           where: 'session_id = ?',
           whereArgs: [sessionId],
           orderBy: 'response_index');
+
+  Future<void> _queueEntity(Transaction txn, String type, String id,
+          String ownerId, String operation) =>
+      txn.insert(
+          'sync_outbox',
+          {
+            'id': '$type:$id',
+            'entity_type': type,
+            'entity_id': id,
+            'caregiver_id': ownerId,
+            'operation': operation,
+            'state': 'pending',
+            'attempts': 0,
+            'next_retry_at': null,
+            'last_error': null,
+            'updated_at': DateTime.now().toUtc().toIso8601String()
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
+
+  String _tableForEntity(String type) => switch (type) {
+        'caregiver' => 'caregiver_cache',
+        'profile' => 'profiles',
+        'deck' => 'decks',
+        'card' => 'cards',
+        'media' => 'media_files',
+        _ => throw ArgumentError.value(type, 'type', 'Unsupported entity type')
+      };
 
   Future<void> _queue(Transaction txn, String id, String type, String entityId,
           String ownerId) =>

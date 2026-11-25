@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'offline_store.dart';
 
 class ActivityResponseRecord {
   final int index;
@@ -24,10 +27,12 @@ class ActivityResponseRecord {
           : '$item placed in $category';
     }
     if (activityKey == 'memory_decks' ||
-        payload['activity_type'] == 'memory_deck') {
+        payload['activity_type'] == 'memory_deck' ||
+        payload['activity_type'] == 'memory_decks') {
       final text = payload['text']?.toString().trim();
       if (text != null && text.isNotEmpty) return 'Shared a text response';
-      if (payload['response_kind'] == 'audio') {
+      if (payload['response_kind'] == 'audio' ||
+          payload['response_kind'] == 'text_and_audio') {
         return 'Recorded a spoken response';
       }
     }
@@ -45,6 +50,7 @@ class ActivitySessionRecord {
   final DateTime? completedAtUtc;
   final String status;
   final List<ActivityResponseRecord> responses;
+  final String syncState;
 
   const ActivitySessionRecord({
     required this.id,
@@ -56,6 +62,7 @@ class ActivitySessionRecord {
     required this.completedAtUtc,
     required this.status,
     required this.responses,
+    this.syncState = 'synced',
   });
 
   Duration? get elapsedDuration {
@@ -163,6 +170,126 @@ Future<ReportingData> loadCaregiverReportingData(
         ),
       ),
   ]);
+}
+
+/// Loads local and authorized cloud records, retaining pending local versions
+/// by stable ID. When the network is unavailable, SQLite remains sufficient
+/// for the report and PDF flows.
+Future<ReportingData> loadCaregiverReportingDataLocalFirst(
+  SupabaseClient client,
+  OfflineStore store,
+  String ownerId,
+  List<Map<String, dynamic>> profiles,
+) async {
+  final local = await loadLocalCaregiverReportingData(store, ownerId, profiles);
+  try {
+    final cloud = await loadCaregiverReportingData(client, profiles);
+    final byId = {for (final session in cloud.sessions) session.id: session};
+    for (final session in local.sessions) {
+      final existing = byId[session.id];
+      if (existing == null || session.syncState != 'synced') {
+        byId[session.id] = session;
+      }
+    }
+    final merged = byId.values.toList()
+      ..sort((a, b) => b.startedAtUtc.compareTo(a.startedAtUtc));
+    return ReportingData(merged);
+  } catch (_) {
+    return local;
+  }
+}
+
+Future<ReportingData> loadLocalCaregiverReportingData(
+  OfflineStore store,
+  String ownerId,
+  List<Map<String, dynamic>> profiles,
+) async {
+  final profileIds = profiles.map((row) => row['id'].toString()).toList();
+  if (ownerId.isEmpty || profileIds.isEmpty) return const ReportingData([]);
+  final sessions = <String, Map<String, dynamic>>{};
+  for (final row in await store.cachedHistory(ownerId, profileIds)) {
+    sessions[row['id'].toString()] = {...row, '_sync_state': 'synced'};
+  }
+  for (final row in await store.localSessions(ownerId, profileIds)) {
+    sessions[row['id'].toString()] = {
+      ...row,
+      'elderly_profile_id': row['profile_id'],
+      'activity_type_id': row['activity_type_id'],
+      '_activity_key': row['activity_key'],
+      '_sync_state': row['sync_state'],
+      'started_at': row['started_at'],
+      'completed_at': row['completed_at'],
+    };
+  }
+  if (sessions.isEmpty) return const ReportingData([]);
+  final responseRows = <String, List<Map<String, dynamic>>>{};
+  final cachedResponses =
+      await store.cachedResponses(ownerId, sessions.keys.toList());
+  for (final row in cachedResponses) {
+    (responseRows[row['session_id'].toString()] ??= []).add(row);
+  }
+  for (final sessionId in sessions.keys) {
+    final localResponses = await store.localResponses(sessionId);
+    final list = responseRows.putIfAbsent(sessionId, () => []);
+    for (final row in localResponses) {
+      if (!list
+          .any((cached) => cached['response_index'] == row['response_index'])) {
+        list.add({
+          'id': row['id'],
+          'session_id': sessionId,
+          'response_index': row['response_index'],
+          'response_payload': jsonDecode(row['payload']! as String),
+          'is_correct':
+              row['is_correct'] == null ? null : row['is_correct'] == 1,
+        });
+      }
+    }
+  }
+  const names = {
+    'memory_decks': 'Memory Decks',
+    'odd_one_out': 'Odd One Out',
+    'everyday_object_sorting': 'Everyday Object Sorting',
+  };
+  final records = <ActivitySessionRecord>[];
+  for (final row in sessions.values) {
+    final id = row['id'].toString();
+    final activityKey = row['_activity_key']?.toString() ?? '';
+    final rawResponses = responseRows[id] ?? const [];
+    rawResponses.sort((a, b) => ((a['response_index'] as num?)?.toInt() ?? 0)
+        .compareTo((b['response_index'] as num?)?.toInt() ?? 0));
+    records.add(ActivitySessionRecord(
+      id: id,
+      profileId: (row['elderly_profile_id'] ?? row['profile_id']).toString(),
+      activityTypeId: row['activity_type_id']?.toString() ?? '',
+      activityKey: activityKey,
+      activityName:
+          row['_activity_name']?.toString() ?? names[activityKey] ?? 'Activity',
+      startedAtUtc:
+          DateTime.tryParse(row['started_at']?.toString() ?? '')?.toUtc() ??
+              DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+      completedAtUtc: row['completed_at'] == null
+          ? null
+          : DateTime.tryParse(row['completed_at'].toString())?.toUtc(),
+      status: row['status']?.toString() ?? 'unknown',
+      syncState: row['_sync_state']?.toString() ?? 'synced',
+      responses: [
+        for (final response in rawResponses)
+          ActivityResponseRecord(
+            index: (response['response_index'] as num?)?.toInt() ?? 0,
+            payload: response['response_payload'] is Map
+                ? Map<String, dynamic>.from(response['response_payload'] as Map)
+                : const <String, dynamic>{},
+            isCorrect: response['is_correct'] is bool
+                ? response['is_correct'] as bool
+                : response['is_correct'] == null
+                    ? null
+                    : response['is_correct'] == 1,
+          ),
+      ],
+    ));
+  }
+  records.sort((a, b) => b.startedAtUtc.compareTo(a.startedAtUtc));
+  return ReportingData(records);
 }
 
 DateTime reportingUtcDate(DateTime date) =>

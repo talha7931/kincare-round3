@@ -1,8 +1,10 @@
 import 'dart:convert';
 
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:kincare_android/cognitive_game_rules.dart';
+import 'package:kincare_android/sorting_game_progress.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -87,5 +89,36 @@ void main() {
       ),
       contains('हर चीज़'),
     );
+  });
+
+  for (final count in [0, 1, 5, 6]) {
+    testWidgets('sorting progress $count of 6 gates Finish Sorting',
+        (tester) async {
+      var finished = false;
+      await tester.pumpWidget(MaterialApp(
+          home: Scaffold(
+              body: SortingGameProgress(
+        categorizedCount: count,
+        totalCount: 6,
+        busy: false,
+        onFinish: () => finished = true,
+      ))));
+      expect(find.text('$count of 6 categorized'), findsOneWidget);
+      final button = tester.widget<FilledButton>(find.byType(FilledButton));
+      expect(button.onPressed != null, count == 6);
+      if (count == 6) {
+        await tester.tap(find.text('Finish Sorting'));
+        expect(finished, isTrue);
+      } else {
+        expect(find.text('Categorize every item before finishing.'),
+            findsOneWidget);
+      }
+    });
+  }
+
+  test('sorting can move an assigned item to a different category', () {
+    final updated = replaceSortingPlacement(
+        {'apple': 'fruit', 'carrot': 'vegetable'}, 'apple', 'vegetable');
+    expect(updated, {'apple': 'vegetable', 'carrot': 'vegetable'});
   });
 }

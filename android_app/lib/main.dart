@@ -3,8 +3,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
 
 import 'app_theme.dart';
+import 'auth_network_diagnostics.dart';
 import 'activity_history_screen.dart';
 import 'cognitive_games_screen.dart';
 import 'cognitive_game_rules.dart';
@@ -22,18 +24,36 @@ const _supabaseUrl = String.fromEnvironment('SUPABASE_URL');
 const _supabasePublishableKey =
     String.fromEnvironment('SUPABASE_PUBLISHABLE_KEY');
 
+String _configuredSupabaseHost() =>
+    Uri.tryParse(_supabaseUrl)?.host ?? 'unavailable';
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  if (_supabaseUrl.isEmpty || _supabasePublishableKey.isEmpty) {
-    throw StateError(
-      'Missing SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY dart-define values.',
+  final missingUrl = _supabaseUrl.trim().isEmpty;
+  final missingPublishableKey = _supabasePublishableKey.trim().isEmpty;
+  if (missingUrl || missingPublishableKey) {
+    AuthNetworkDiagnostics.logMissingConfiguration(
+      urlMissing: missingUrl,
+      publishableKeyMissing: missingPublishableKey,
     );
+    throw const MissingSupabaseConfigurationException();
   }
 
-  await Supabase.initialize(
-    url: _supabaseUrl,
-    publishableKey: _supabasePublishableKey,
-  );
+  final host = _configuredSupabaseHost();
+  AuthNetworkDiagnostics.logConfigurationReady(host: host);
+  try {
+    await Supabase.initialize(
+      url: _supabaseUrl,
+      publishableKey: _supabasePublishableKey,
+    );
+  } catch (error) {
+    AuthNetworkDiagnostics.logFailure(
+      operation: 'supabase_initialize',
+      error: error,
+      host: host,
+    );
+    rethrow;
+  }
 
   runApp(const KinCareApp());
 }
@@ -135,6 +155,14 @@ class _AuthScreenState extends State<AuthScreen> {
     });
   }
 
+  void _logAuthFailure(String operation, Object error) {
+    AuthNetworkDiagnostics.logFailure(
+      operation: operation,
+      error: error,
+      host: _configuredSupabaseHost(),
+    );
+  }
+
   String _friendlyAuthError(Object error) {
     final raw = error.toString().toLowerCase();
     if (raw.contains('rate limit') ||
@@ -197,8 +225,12 @@ class _AuthScreenState extends State<AuthScreen> {
         });
       }
     } on AuthException catch (error) {
+      _logAuthFailure(
+          _phoneOtpSent ? 'phone_otp_verify' : 'phone_otp_request', error);
       setState(() => _error = _friendlyAuthError(error));
     } catch (error) {
+      _logAuthFailure(
+          _phoneOtpSent ? 'phone_otp_verify' : 'phone_otp_request', error);
       setState(() => _error = _friendlyAuthError(error));
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -238,6 +270,7 @@ class _AuthScreenState extends State<AuthScreen> {
         );
       }
     } on AuthException catch (error) {
+      _logAuthFailure(_register ? 'account_register' : 'email_sign_in', error);
       final message = _friendlyAuthError(error);
       setState(() {
         _error = message;
@@ -248,6 +281,7 @@ class _AuthScreenState extends State<AuthScreen> {
         }
       });
     } catch (error) {
+      _logAuthFailure(_register ? 'account_register' : 'email_sign_in', error);
       setState(() => _error = _friendlyAuthError(error));
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -273,12 +307,14 @@ class _AuthScreenState extends State<AuthScreen> {
             'A new confirmation email was requested. Please wait for it to arrive.';
       });
     } on AuthException catch (error) {
+      _logAuthFailure('email_confirmation_resend', error);
       final message = _friendlyAuthError(error);
       setState(() => _error = message);
       if (message.startsWith('Too many verification requests')) {
         _startResendCooldown();
       }
     } catch (error) {
+      _logAuthFailure('email_confirmation_resend', error);
       setState(() => _error = _friendlyAuthError(error));
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -614,9 +650,15 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
           'display_name': fallback.isEmpty ? null : fallback,
         });
         _caregiverNameController.text = fallback;
+        await OfflineStore.instance.cacheCaregiver(widget.user.id, {
+          'id': widget.user.id,
+          'display_name': fallback.isEmpty ? null : fallback,
+        });
       } else {
         _caregiverNameController.text =
             caregiver['display_name']?.toString() ?? '';
+        await OfflineStore.instance.cacheCaregiver(
+            widget.user.id, Map<String, dynamic>.from(caregiver));
       }
 
       await _loadProfiles();
@@ -647,24 +689,32 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
   }
 
   Future<void> _loadProfiles() async {
-    final data = await _client
-        .from('elderly_profiles')
-        .select('id, display_name, preferred_language')
-        .eq('caregiver_id', widget.user.id)
-        .order('created_at');
-
+    final store = OfflineStore.instance;
+    String? refreshMessage;
+    try {
+      final data = await _client
+          .from('elderly_profiles')
+          .select('id, caregiver_id, display_name, preferred_language')
+          .eq('caregiver_id', widget.user.id)
+          .order('created_at')
+          .timeout(const Duration(seconds: 8));
+      await store.cacheProfiles(
+          widget.user.id, List<Map<String, dynamic>>.from(data));
+    } catch (_) {
+      refreshMessage = 'Offline mode: showing profiles saved on this device.';
+    }
+    final localProfiles = await store.readProfiles(widget.user.id);
+    if (!mounted) return;
     setState(() {
-      _profiles = List<Map<String, dynamic>>.from(data);
+      _profiles = localProfiles;
       if (_selectedProfileId != null) {
         _selectedProfile = _profiles.cast<Map<String, dynamic>?>().firstWhere(
               (profile) => profile?['id'] == _selectedProfileId,
               orElse: () => null,
             );
       }
+      if (refreshMessage != null) _error = refreshMessage;
     });
-    await OfflineStore.instance
-        .cacheProfiles(widget.user.id, _profiles)
-        .catchError((_) {});
   }
 
   Future<void> _saveCaregiverName() async {
@@ -674,11 +724,19 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
       _profileMutationLoading = true;
     });
     try {
-      await _client.from('caregivers').update({
+      final cached = await OfflineStore.instance.readCaregiver(widget.user.id);
+      await OfflineStore.instance.saveCaregiverLocal(widget.user.id, {
+        ...?cached,
+        'id': widget.user.id,
         'display_name': _caregiverNameController.text.trim().isEmpty
             ? null
-            : _caregiverNameController.text.trim()
-      }).eq('id', widget.user.id);
+            : _caregiverNameController.text.trim(),
+      });
+      if (mounted) {
+        setState(() => _error =
+            'Caregiver details saved on this device; waiting to synchronize.');
+      }
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
     } catch (error) {
       setState(() => _error = error.toString());
     } finally {
@@ -694,14 +752,20 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
       _profileMutationLoading = true;
     });
     try {
-      await _client.from('elderly_profiles').insert({
+      final profile = <String, dynamic>{
+        'id': const Uuid().v4(),
         'caregiver_id': widget.user.id,
         'display_name': _profileNameController.text.trim(),
         'preferred_language': _profileLanguage,
-      });
+      };
+      await OfflineStore.instance.saveProfile(widget.user.id, profile);
       _profileNameController.clear();
-      setState(() => _profileLanguage = 'en');
+      setState(() {
+        _profileLanguage = 'en';
+        _error = 'Profile saved on this device; waiting to synchronize.';
+      });
       await _loadProfiles();
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
     } catch (error) {
       setState(() => _error = error.toString());
     } finally {
@@ -716,12 +780,17 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
       _profileMutationLoading = true;
     });
     try {
-      await _client.from('elderly_profiles').update({
+      final profile = <String, dynamic>{
+        ..._selectedProfile!,
         'display_name': _selectedProfile!['display_name'].toString().trim(),
         'preferred_language':
             _selectedProfile!['preferred_language'].toString(),
-      }).eq('id', _selectedProfileId!);
+      };
+      await OfflineStore.instance.saveProfile(widget.user.id, profile);
+      setState(() =>
+          _error = 'Profile saved on this device; waiting to synchronize.');
       await _loadProfiles();
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
     } catch (error) {
       setState(() => _error = error.toString());
     } finally {
@@ -753,19 +822,20 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
       _profileMutationLoading = true;
     });
     try {
-      await _client.from('elderly_profiles').delete().eq('id', profile['id']);
+      await OfflineStore.instance
+          .deleteProfile(widget.user.id, profile['id'].toString());
       if (_selectedProfileId == profile['id']) {
         setState(() {
           _selectedProfileId = null;
           _selectedProfile = null;
         });
       }
+      setState(() => _error =
+          'Profile removed on this device; deletion is waiting to synchronize.');
       await _loadProfiles();
+      unawaited(OfflineSyncService(_client).initialize(widget.user.id));
     } catch (error) {
-      final message = error.toString();
-      setState(() => _error = message.toLowerCase().contains('foreign key')
-          ? 'This profile has dependent records and cannot be deleted yet.'
-          : message);
+      setState(() => _error = 'Could not save this deletion locally: $error');
     } finally {
       if (mounted) setState(() => _profileMutationLoading = false);
     }
@@ -776,14 +846,16 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
     final ownerId = _client.auth.currentUser?.id;
     if (ownerId == null) return;
     final counts = await OfflineStore.instance.outboxCounts(ownerId);
-    final pending = (counts['pending'] ?? 0) + (counts['failed'] ?? 0);
+    final pending = (counts['pending'] ?? 0) +
+        (counts['failed'] ?? 0) +
+        (counts['conflict'] ?? 0);
     if (!mounted) return;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Sign out of KinCare?'),
         content: Text(pending > 0
-            ? '$pending activity record${pending == 1 ? '' : 's'} still need to sync. They will stay saved for this caregiver and will not be shared with another account. Continue signing out?'
+            ? '$pending saved change${pending == 1 ? '' : 's'} still need to sync or be reviewed. They will stay saved for this caregiver and will not be shared with another account. Continue signing out?'
             : 'You can sign back in to access this caregiver account.'),
         actions: [
           TextButton(
@@ -1249,6 +1321,7 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
                         ? CaregiverDashboardScreen(
                             profiles: _profiles,
                             caregiverName: _caregiverNameController.text,
+                            ownerId: widget.user.id,
                             onOpenProfileReport: (profileId) => setState(() {
                               _selectedProfileId = profileId;
                               _selectedProfile = _profiles.firstWhere(
@@ -1263,6 +1336,7 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
                                 profiles: _profiles,
                                 caregiverName: _caregiverNameController.text,
                                 initialProfileId: _selectedProfileId,
+                                ownerId: widget.user.id,
                               )
                             : _caregiverSection == 'memory'
                                 ? MemoryDecksScreen(
@@ -1520,6 +1594,12 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
                                                                               color: KinCareColors.textMuted,
                                                                             ),
                                                                           ),
+                                                                          Text(
+                                                                            _profileSyncLabel(profile['_sync_state']?.toString() ??
+                                                                                'synced'),
+                                                                            style:
+                                                                                const TextStyle(fontSize: 12, color: KinCareColors.textMuted),
+                                                                          ),
                                                                         ],
                                                                       ),
                                                                     ),
@@ -1676,6 +1756,17 @@ class _CaregiverScreenState extends State<CaregiverScreen> {
     );
   }
 }
+
+String _profileSyncLabel(String state) => switch (state) {
+      'pending_create' ||
+      'pending_update' ||
+      'pending_delete' ||
+      'local_only' =>
+        'Saved on this device · waiting to sync',
+      'failed' => 'Saved on this device · sync failed',
+      'conflict' => 'Needs review before syncing',
+      _ => 'Synchronized',
+    };
 
 /// One entry in the elderly activity board.
 class _SeniorActivity {

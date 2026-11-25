@@ -142,6 +142,13 @@ class OfflineCachePreparation {
       final sessions = <Map<String, dynamic>>[];
       if (profileIds.isNotEmpty) {
         _stage = 'Loading activity history';
+        final activityTypes = List<Map<String, dynamic>>.from(await client
+            .from('activity_types')
+            .select('id, stable_key, name')
+            .timeout(const Duration(seconds: 8)));
+        final activityById = {
+          for (final type in activityTypes) type['id'].toString(): type,
+        };
         final history = await fetchAllPages<Map<String, dynamic>>(
             (from, to) async => List<Map<String, dynamic>>.from(await client
                 .from('activity_sessions')
@@ -156,7 +163,15 @@ class OfflineCachePreparation {
         sessions.addAll(history
             .where((row) => authorizedProfileIds
                 .contains(row['elderly_profile_id']?.toString()))
-            .map((row) => {...row, 'caregiver_id': owner}));
+            .map((row) {
+          final activity = activityById[row['activity_type_id']?.toString()];
+          return {
+            ...row,
+            'caregiver_id': owner,
+            '_activity_key': activity?['stable_key'],
+            '_activity_name': activity?['name'],
+          };
+        }));
         _discover(sessions.length);
         for (final session in sessions) {
           await store.cacheHistory(owner, [session], const []);
@@ -225,6 +240,7 @@ class OfflineCachePreparation {
           try {
             _stage = 'Caching cards and media';
             await store.setCacheItem(owner, 'deck', deckId, 'downloading');
+            final cardSnapshotStartedAt = DateTime.now().toUtc();
             final cards = await fetchAllPages<Map<String, dynamic>>(
                 (from, to) async => List<Map<String, dynamic>>.from(await client
                     .from('memory_cards')
@@ -237,13 +253,13 @@ class OfflineCachePreparation {
             _ensureOwner(owner);
             deck['_card_count'] = cards.length;
             _discover(cards.length);
-            await store.cacheDeck(owner, profileId, deck, cards);
+            await store.cacheDeck(owner, profileId, deck, cards,
+                remoteSnapshotStartedAt: cardSnapshotStartedAt);
             final cardsMissingPhotos = cards
                 .where((card) =>
                     (card['photo_asset_id']?.toString() ?? '').isEmpty)
                 .toList();
             if (cardsMissingPhotos.isNotEmpty) {
-              _discover(cardsMissingPhotos.length);
               for (final card in cardsMissingPhotos) {
                 await store.setCacheItem(owner, 'card', card['id'].toString(),
                     'partial', 'Required photograph is missing.');
@@ -251,8 +267,6 @@ class OfflineCachePreparation {
               }
               failedDeck = true;
             }
-            _completed += cards.length;
-            _publish();
 
             final assetIds = <String>{};
             for (final card in cards) {
@@ -342,7 +356,12 @@ class OfflineCachePreparation {
                   cardReady
                       ? null
                       : 'One or more card media files are unavailable offline.');
-              if (!cardReady) failedDeck = true;
+              if (cardReady) {
+                _done();
+              } else {
+                failedDeck = true;
+                _fail();
+              }
             }
             final ready = !failedDeck &&
                 await store.allMediaCached(owner, assetIds.toList());

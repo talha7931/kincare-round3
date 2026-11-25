@@ -1,10 +1,16 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
 
 import 'app_theme.dart';
+import 'offline_sync.dart';
 import 'offline_store.dart';
 
 /// Elderly-facing Memory Deck and Memory Card viewer.
@@ -35,6 +41,13 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
   List<Map<String, dynamic>> _cards = [];
   int _cardIndex = 0;
   bool _storyRevealed = false;
+  String? _sessionId;
+  final TextEditingController _responseController = TextEditingController();
+  final AudioRecorder _responseRecorder = AudioRecorder();
+  bool _recordingResponse = false;
+  String? _recordingPath;
+  String? _responseAudioAssetId;
+  final Map<String, Map<String, dynamic>> _draftResponses = {};
 
   bool _loadingDecks = true;
   bool _loadingCards = false;
@@ -63,6 +76,8 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
   void dispose() {
     _playerCompleteSub?.cancel();
     _audioPlayer.dispose();
+    _responseController.dispose();
+    _responseRecorder.dispose();
     super.dispose();
   }
 
@@ -130,7 +145,8 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
     try {
       final data = await _client
           .from('memory_decks')
-          .select('id, title, language_code, created_at')
+          .select(
+              'id, elderly_profile_id, created_by_caregiver_id, title, language_code, created_at, updated_at')
           .eq('elderly_profile_id', profileId)
           .order('created_at');
 
@@ -144,9 +160,15 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
         deck['_card_count'] = (countResult as List).length;
         await _store.cacheDeckMetadata(_caregiverId, profileId, deck);
       }
+      final localDecks = await _store.readDecks(_caregiverId, profileId);
+      for (final deck in localDecks) {
+        deck['_card_count'] =
+            (await _store.readCards(_caregiverId, deck['id'].toString()))
+                .length;
+      }
 
       setState(() {
-        _decks = deckList;
+        _decks = localDecks;
         _loadingDecks = false;
       });
     } catch (e) {
@@ -172,15 +194,21 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
       _cardIndex = 0;
       _storyRevealed = false;
       _cards = [];
+      _sessionId = null;
+      _draftResponses.clear();
+      _responseController.clear();
+      _responseAudioAssetId = null;
     });
 
     try {
+      final cardSnapshotStartedAt = DateTime.now().toUtc();
       final cardRows = await _client
           .from('memory_cards')
           .select(
               'id, deck_id, photo_asset_id, question_audio_asset_id, answer_audio_asset_id, question_text, answer_context, display_order')
           .eq('deck_id', deck['id'])
-          .order('display_order');
+          .order('display_order')
+          .timeout(const Duration(seconds: 8));
 
       final loadedCards = List<Map<String, dynamic>>.from(cardRows);
       await _store.cacheDeck(
@@ -188,21 +216,25 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
           deck['elderly_profile_id']?.toString() ??
               widget.selectedProfile['id'].toString(),
           deck,
-          loadedCards);
+          loadedCards,
+          remoteSnapshotStartedAt: cardSnapshotStartedAt);
+      final visibleCards =
+          await _store.readCards(_caregiverId, deck['id'].toString());
 
       // Pre-fetch signed URL for the first photo
-      if (loadedCards.isNotEmpty) {
-        final firstPhotoId = loadedCards.first['photo_asset_id']?.toString();
+      if (visibleCards.isNotEmpty) {
+        final firstPhotoId = visibleCards.first['photo_asset_id']?.toString();
         if (firstPhotoId != null) {
           await _resolveSignedUrl(firstPhotoId);
         }
       }
-      unawaited(_cacheDeckMedia(loadedCards));
+      unawaited(_cacheDeckMedia(visibleCards));
 
       setState(() {
-        _cards = loadedCards;
+        _cards = visibleCards;
         _loadingCards = false;
       });
+      if (visibleCards.isNotEmpty) await _beginOrRestoreDeckSession(deck);
     } catch (e) {
       final cachedCards =
           await _store.readCards(_caregiverId, deck['id'].toString());
@@ -211,7 +243,119 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
         _error = cachedCards.isEmpty ? 'Unable to load cards: $e' : null;
         _loadingCards = false;
       });
+      if (cachedCards.isNotEmpty) {
+        try {
+          await _beginOrRestoreDeckSession(deck);
+        } catch (activityError) {
+          if (mounted) setState(() => _error = activityError.toString());
+        }
+      }
     }
+  }
+
+  Future<void> _beginOrRestoreDeckSession(Map<String, dynamic> deck) async {
+    final ownerId = _caregiverId;
+    final profileId = widget.selectedProfile['id'].toString();
+    final deckId = deck['id'].toString();
+    if (ownerId.isEmpty) throw StateError('Caregiver identity is unavailable.');
+    final existing =
+        await _store.resumableDeckSession(ownerId, profileId, deckId);
+    if (existing != null) {
+      final sessionId = existing['id']!.toString();
+      final checkpoint = await _store.readGameCheckpoint(ownerId, sessionId);
+      final responseDrafts = <String, Map<String, dynamic>>{};
+      final rawResponses = checkpoint?['responses'];
+      if (rawResponses is Map) {
+        for (final entry in rawResponses.entries) {
+          if (entry.value is Map) {
+            responseDrafts[entry.key.toString()] =
+                Map<String, dynamic>.from(entry.value as Map);
+          }
+        }
+      }
+      final index = (checkpoint?['card_index'] as num?)?.toInt() ?? 0;
+      if (!mounted) return;
+      setState(() {
+        _sessionId = sessionId;
+        _cardIndex = index.clamp(0, _cards.length - 1);
+        _draftResponses
+          ..clear()
+          ..addAll(responseDrafts);
+        final current = _draftResponses[_cards[_cardIndex]['id'].toString()];
+        _responseController.text =
+            current?['response_payload']?['text']?.toString() ?? '';
+        _responseAudioAssetId = current?['response_audio_asset_id']?.toString();
+        _storyRevealed = false;
+      });
+      return;
+    }
+
+    final preferences = await SharedPreferences.getInstance();
+    var deviceUuid = preferences.getString('kincare.device_uuid');
+    if (deviceUuid == null || deviceUuid.isEmpty) {
+      deviceUuid = const Uuid().v4();
+      await preferences.setString('kincare.device_uuid', deviceUuid);
+    }
+    String? deviceId;
+    String? activityTypeId;
+    final network = await Connectivity().checkConnectivity();
+    final hasNetwork =
+        network.any((result) => result != ConnectivityResult.none);
+    if (hasNetwork) {
+      try {
+        final device = await _client
+            .from('enrolled_devices')
+            .upsert({
+              'caregiver_id': ownerId,
+              'device_uuid': deviceUuid,
+              'device_name': 'KinCare Android device',
+              'last_seen_at': DateTime.now().toUtc().toIso8601String(),
+            }, onConflict: 'caregiver_id,device_uuid')
+            .select('id, revoked_at')
+            .single();
+        if (device['revoked_at'] != null) {
+          throw StateError('This enrolled device was revoked.');
+        }
+        deviceId = device['id'].toString();
+        await _store.cacheDevice(ownerId, deviceUuid, deviceId, null);
+        try {
+          final activity = await _client
+              .from('activity_types')
+              .select('id')
+              .eq('stable_key', 'memory_decks')
+              .maybeSingle();
+          activityTypeId = activity?['id']?.toString();
+        } catch (_) {}
+      } catch (error) {
+        final cached = await _store.readDevice(ownerId, deviceUuid);
+        if (cached == null || cached['revoked_at'] != null) rethrow;
+        deviceId = cached['device_id']?.toString();
+      }
+    } else {
+      final cached = await _store.readDevice(ownerId, deviceUuid);
+      if (cached == null || cached['revoked_at'] != null) {
+        throw StateError(
+            'Connect this device once before starting an offline Memory Deck activity.');
+      }
+      deviceId = cached['device_id']?.toString();
+    }
+    final sessionId = const Uuid().v4();
+    await _store.createSession(
+      id: sessionId,
+      caregiverId: ownerId,
+      profileId: profileId,
+      activityKey: 'memory_decks',
+      activityTypeId: activityTypeId,
+      deviceId: deviceId,
+      memoryDeckId: deckId,
+      startedAt: DateTime.now().toUtc().toIso8601String(),
+    );
+    await _store.saveGameCheckpoint(
+        caregiverId: ownerId,
+        sessionId: sessionId,
+        gameKey: 'memory_decks',
+        payload: {'card_index': 0, 'responses': <String, dynamic>{}});
+    if (mounted) setState(() => _sessionId = sessionId);
   }
 
   Future<void> _cacheDeckMedia(List<Map<String, dynamic>> cards) async {
@@ -321,31 +465,174 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
         File(path).existsSync() ? DeviceFileSource(path) : UrlSource(path));
   }
 
-  void _nextCard() {
-    _stopAudio();
+  Future<void> _saveDeckCheckpoint({int? cardIndex}) async {
+    final sessionId = _sessionId;
+    final ownerId = _caregiverId;
+    if (sessionId == null || ownerId.isEmpty) return;
+    await _store.saveGameCheckpoint(
+        caregiverId: ownerId,
+        sessionId: sessionId,
+        gameKey: 'memory_decks',
+        payload: {
+          'card_index': cardIndex ?? _cardIndex,
+          'responses': _draftResponses,
+        });
+  }
+
+  Future<void> _captureCurrentResponse() async {
+    if (_sessionId == null || _cards.isEmpty) return;
+    final card = _cards[_cardIndex];
+    final cardId = card['id'].toString();
+    final previous = _draftResponses[cardId];
+    final text = _responseController.text.trim();
+    final audioId = _responseAudioAssetId;
+    final kind = audioId != null
+        ? (text.isNotEmpty ? 'text_and_audio' : 'audio')
+        : text.isNotEmpty
+            ? 'text'
+            : 'no_response';
+    _draftResponses[cardId] = {
+      'id': previous?['id'] ?? const Uuid().v4(),
+      'response_index': _cardIndex,
+      'response_payload': {
+        'schema_version': 1,
+        'activity_type': 'memory_decks',
+        'deck_id': _activeDeck?['id'],
+        'card_id': cardId,
+        'response_kind': kind,
+        if (text.isNotEmpty) 'text': text,
+      },
+      'is_correct': null,
+      'response_audio_asset_id': audioId,
+      'responded_at':
+          previous?['responded_at'] ?? DateTime.now().toUtc().toIso8601String(),
+    };
+    await _saveDeckCheckpoint();
+  }
+
+  Future<void> _nextCard() async {
+    await _stopAudio();
+    await _captureCurrentResponse();
     if (_cardIndex < _cards.length - 1) {
+      final nextIndex = _cardIndex + 1;
+      final nextCard = _cards[nextIndex];
+      final draft = _draftResponses[nextCard['id'].toString()];
       setState(() {
-        _cardIndex++;
+        _cardIndex = nextIndex;
         _storyRevealed = false;
+        _responseController.text =
+            draft?['response_payload']?['text']?.toString() ?? '';
+        _responseAudioAssetId = draft?['response_audio_asset_id']?.toString();
       });
-      // Preload next photo
-      if (_cardIndex + 1 < _cards.length) {
-        _resolveSignedUrl(_cards[_cardIndex + 1]['photo_asset_id']?.toString());
+      await _saveDeckCheckpoint();
+      if (nextIndex + 1 < _cards.length) {
+        unawaited(_resolveSignedUrl(
+            _cards[nextIndex + 1]['photo_asset_id']?.toString()));
       }
-    } else {
-      // Completed deck
-      setState(() => _activeDeck = null);
+      return;
+    }
+    final ownerId = _caregiverId;
+    if (_sessionId != null && ownerId.isNotEmpty) {
+      setState(() => _loadingCards = true);
+      try {
+        final responses = _draftResponses.values.toList()
+          ..sort((a, b) => (a['response_index'] as int)
+              .compareTo(b['response_index'] as int));
+        await _store.completeSessionWithResponses(
+            _sessionId!, ownerId, responses);
+        unawaited(OfflineSyncService(_client).initialize(ownerId));
+      } catch (error) {
+        if (mounted) {
+          setState(() {
+            _loadingCards = false;
+            _error = 'Your responses are still saved on this device: $error';
+          });
+        }
+        return;
+      }
+    }
+    if (mounted) {
+      setState(() {
+        _activeDeck = null;
+        _sessionId = null;
+        _loadingCards = false;
+        _draftResponses.clear();
+        _responseController.clear();
+        _responseAudioAssetId = null;
+      });
     }
   }
 
-  void _previousCard() {
-    _stopAudio();
+  Future<void> _previousCard() async {
+    await _stopAudio();
+    await _captureCurrentResponse();
     if (_cardIndex > 0) {
+      final previousIndex = _cardIndex - 1;
+      final previousCard = _cards[previousIndex];
+      final draft = _draftResponses[previousCard['id'].toString()];
       setState(() {
-        _cardIndex--;
+        _cardIndex = previousIndex;
         _storyRevealed = false;
+        _responseController.text =
+            draft?['response_payload']?['text']?.toString() ?? '';
+        _responseAudioAssetId = draft?['response_audio_asset_id']?.toString();
       });
+      await _saveDeckCheckpoint();
     }
+  }
+
+  Future<void> _startResponseRecording() async {
+    if (await _responseRecorder.hasPermission() == false) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text(
+                'Microphone unavailable. You can type a response instead.')));
+      }
+      return;
+    }
+    final root = await getApplicationSupportDirectory();
+    final directory =
+        Directory('${root.path}${Platform.pathSeparator}pending-recordings');
+    await directory.create(recursive: true);
+    _recordingPath =
+        '${directory.path}${Platform.pathSeparator}${const Uuid().v4()}.m4a';
+    await _responseRecorder.start(const RecordConfig(), path: _recordingPath!);
+    if (mounted) setState(() => _recordingResponse = true);
+  }
+
+  Future<void> _stopResponseRecording() async {
+    final path = await _responseRecorder.stop();
+    if (mounted) setState(() => _recordingResponse = false);
+    if (path == null || _sessionId == null) return;
+    try {
+      final assetId = const Uuid().v4();
+      final durablePath = await _store.importLocalMedia(
+          ownerId: _caregiverId,
+          assetId: assetId,
+          profileId: widget.selectedProfile['id'].toString(),
+          deckId: _activeDeck?['id']?.toString(),
+          cardId: _cards[_cardIndex]['id'].toString(),
+          mediaType: 'response_audio',
+          mimeType: 'audio/m4a',
+          source: File(path));
+      if (!mounted) return;
+      setState(() => _responseAudioAssetId = assetId);
+      await _captureCurrentResponse();
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              'Recording saved on this device (${File(durablePath).existsSync() ? 'ready' : 'unavailable'}).')));
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Recording kept for retry: $error')));
+      }
+    }
+  }
+
+  Future<void> _prepareToLeaveDeck() async {
+    if (_recordingResponse) await _stopResponseRecording();
+    await _stopAudio();
+    await _captureCurrentResponse();
   }
 
   // ---------------------------------------------------------------------------
@@ -390,9 +677,10 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
           child: SizedBox(
             height: KinCareSenior.controlHeight,
             child: FilledButton.icon(
-              onPressed: () {
-                _stopAudio();
+              onPressed: () async {
+                await _stopAudio();
                 if (_activeDeck != null) {
+                  await _prepareToLeaveDeck();
                   setState(() => _activeDeck = null);
                 } else {
                   widget.onBack();
@@ -418,8 +706,8 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
           child: SizedBox(
             height: KinCareSenior.controlHeight,
             child: FilledButton.icon(
-              onPressed: () {
-                _stopAudio();
+              onPressed: () async {
+                await _prepareToLeaveDeck();
                 widget.onHome();
               },
               icon: const Icon(Icons.home, size: 28),
@@ -855,6 +1143,63 @@ class _ElderlyMemoryScreenState extends State<ElderlyMemoryScreen> {
               playingLabel: 'Stop Audio',
             ),
           ],
+
+          const SizedBox(height: KinCareSpace.x4),
+          const Text('Would you like to share what you remember?',
+              style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w700,
+                  color: KinCareColors.forest)),
+          const SizedBox(height: KinCareSpace.x2),
+          TextField(
+            controller: _responseController,
+            minLines: 2,
+            maxLines: 4,
+            textCapitalization: TextCapitalization.sentences,
+            decoration: const InputDecoration(
+                hintText: 'Type a memory here (optional)',
+                border: OutlineInputBorder()),
+            onChanged: (_) => unawaited(_captureCurrentResponse()),
+          ),
+          const SizedBox(height: KinCareSpace.x2),
+          Wrap(
+              spacing: KinCareSpace.x2,
+              runSpacing: KinCareSpace.x2,
+              children: [
+                SizedBox(
+                  height: KinCareSenior.controlHeight,
+                  child: FilledButton.icon(
+                    onPressed: _recordingResponse
+                        ? _stopResponseRecording
+                        : _startResponseRecording,
+                    icon: Icon(_recordingResponse ? Icons.stop : Icons.mic,
+                        size: 26),
+                    label: Text(
+                        _recordingResponse
+                            ? 'Stop recording'
+                            : 'Record response',
+                        style: const TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.w700)),
+                  ),
+                ),
+                if (_responseAudioAssetId != null)
+                  SizedBox(
+                    height: KinCareSenior.controlHeight,
+                    child: OutlinedButton.icon(
+                      onPressed: () async {
+                        final path = await _store.mediaPath(
+                            _caregiverId, _responseAudioAssetId!);
+                        if (path != null) {
+                          await _audioPlayer.stop();
+                          await _audioPlayer.play(DeviceFileSource(path));
+                        }
+                      },
+                      icon: const Icon(Icons.play_arrow, size: 26),
+                      label: const Text('Play recording',
+                          style: TextStyle(fontSize: 18)),
+                    ),
+                  ),
+              ]),
 
           const SizedBox(height: KinCareSpace.x5),
 

@@ -14,6 +14,7 @@ import 'app_theme.dart';
 import 'cognitive_game_rules.dart';
 import 'offline_store.dart';
 import 'offline_sync.dart';
+import 'sorting_game_progress.dart';
 
 class CognitiveGamesScreen extends StatefulWidget {
   final Map<String, dynamic> selectedProfile;
@@ -47,6 +48,7 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
   int _roundIndex = 0;
   String? _selectedOddItem;
   bool _oddResponseSaved = false;
+  final Map<int, Map<String, dynamic>> _draftOddResponses = {};
   final Map<String, String> _placements = {};
   String? _selectedSortingItem;
   final Map<String, String> _responseIds = {};
@@ -67,7 +69,8 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
   bool _isTransportFailure(Object error) =>
       error is SocketException ||
       error is TimeoutException ||
-      RegExp(r'network|connection|socket|timeout|failed to fetch', caseSensitive: false)
+      RegExp(r'network|connection|socket|timeout|failed to fetch',
+              caseSensitive: false)
           .hasMatch(error.toString());
 
   @override
@@ -117,6 +120,85 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
         throw StateError(
             'The selected profile is not in this caregiver’s saved profile list.');
       }
+      final profileId = widget.selectedProfile['id'].toString();
+      final existing =
+          await _store.resumableSession(user.id, profileId, _activityKey);
+      if (existing != null) {
+        final sessionId = existing['id']!.toString();
+        final checkpoint = await _store.readGameCheckpoint(user.id, sessionId);
+        final responses = await _store.localResponses(sessionId);
+        final restoredResponseIds = <String, String>{};
+        final restoredOddDrafts = <int, Map<String, dynamic>>{};
+        for (final response in responses) {
+          final payload = jsonDecode(response['payload']! as String)
+              as Map<String, dynamic>;
+          if (payload['activity_type'] == 'odd_one_out') {
+            final index = response['response_index'] as int;
+            restoredResponseIds['odd-$index'] = response['id'].toString();
+            restoredOddDrafts[index] = {
+              'id': response['id'].toString(),
+              'session_id': sessionId,
+              'response_index': index,
+              'response_payload': payload,
+              'is_correct': response['is_correct'] == 1,
+              'responded_at': response['responded_at'],
+            };
+          } else if (payload['activity_type'] == 'everyday_object_sorting') {
+            restoredResponseIds['sort-${payload['item_id']}'] =
+                response['id'].toString();
+          }
+        }
+        final checkpointIds = checkpoint?['response_ids'];
+        if (checkpointIds is Map) {
+          restoredResponseIds.addAll(checkpointIds
+              .map((key, value) => MapEntry(key.toString(), value.toString())));
+        }
+        final checkpointDrafts = checkpoint?['odd_responses'];
+        if (checkpointDrafts is Map) {
+          for (final entry in checkpointDrafts.entries) {
+            final index = int.tryParse(entry.key.toString());
+            if (index != null && entry.value is Map) {
+              restoredOddDrafts[index] =
+                  Map<String, dynamic>.from(entry.value as Map);
+            }
+          }
+        }
+        final placements = <String, String>{};
+        final rawPlacements = checkpoint?['placements'];
+        if (rawPlacements is Map) {
+          placements.addAll(rawPlacements
+              .map((key, value) => MapEntry(key.toString(), value.toString())));
+        }
+        final roundIndex = (checkpoint?['round_index'] as num?)?.toInt() ??
+            (responses.isEmpty
+                ? 0
+                : responses
+                    .map((row) => (row['response_index'] as int?) ?? 0)
+                    .reduce((a, b) => a > b ? a : b));
+        if (!mounted) return;
+        setState(() {
+          _sessionId = sessionId;
+          _stage = 'playing';
+          _roundIndex = roundIndex.clamp(0, 2);
+          _selectedOddItem = checkpoint?['selected_odd_item']?.toString();
+          _oddResponseSaved = checkpoint?['odd_response_saved'] == true ||
+              restoredResponseIds.containsKey('odd-$_roundIndex');
+          _feedback = checkpoint?['feedback']?.toString();
+          _placements
+            ..clear()
+            ..addAll(placements);
+          _selectedSortingItem =
+              checkpoint?['selected_sorting_item']?.toString();
+          _responseIds
+            ..clear()
+            ..addAll(restoredResponseIds);
+          _draftOddResponses
+            ..clear()
+            ..addAll(restoredOddDrafts);
+        });
+        unawaited(OfflineSyncService(_client).initialize(user.id));
+        return;
+      }
       final preferences = await SharedPreferences.getInstance();
       var deviceUuid = preferences.getString('kincare.device_uuid');
       if (deviceUuid == null || deviceUuid.isEmpty) {
@@ -163,7 +245,9 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
           }
         } catch (error) {
           final cachedDevice = await _store.readDevice(user.id, deviceUuid);
-          if (!_isTransportFailure(error) || cachedDevice == null || cachedDevice['revoked_at'] != null) rethrow;
+          if (!_isTransportFailure(error) ||
+              cachedDevice == null ||
+              cachedDevice['revoked_at'] != null) rethrow;
           deviceId = cachedDevice['device_id']?.toString();
         }
       } else {
@@ -184,6 +268,16 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
         deviceId: deviceId,
         startedAt: DateTime.now().toUtc().toIso8601String(),
       );
+      await _store.saveGameCheckpoint(
+          caregiverId: user.id,
+          sessionId: sessionId,
+          gameKey: _activityKey,
+          payload: {
+            'stage': 'playing',
+            'round_index': 0,
+            'placements': <String, String>{},
+            'response_ids': <String, String>{},
+          });
       if (!mounted) return;
       setState(() {
         _sessionId = sessionId;
@@ -197,13 +291,26 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
     }
   }
 
-  Future<void> _saveResponses(List<Map<String, dynamic>> responses) async {
-    final userId = _client.auth.currentUser?.id;
-    if (userId == null)
-      throw StateError(
-          'Your saved caregiver account is not available on this device.');
-    await _store.saveResponses(_sessionId!, userId, responses);
-    unawaited(OfflineSyncService(_client).initialize(userId));
+  Future<void> _saveCheckpoint({String? stage, bool? oddResponseSaved}) async {
+    final ownerId = _client.auth.currentUser?.id;
+    final sessionId = _sessionId;
+    if (ownerId == null || sessionId == null) return;
+    await _store.saveGameCheckpoint(
+        caregiverId: ownerId,
+        sessionId: sessionId,
+        gameKey: _activityKey,
+        payload: {
+          'stage': stage ?? _stage,
+          'round_index': _roundIndex,
+          'selected_odd_item': _selectedOddItem,
+          'odd_response_saved': oddResponseSaved ?? _oddResponseSaved,
+          'placements': _placements,
+          'selected_sorting_item': _selectedSortingItem,
+          'response_ids': _responseIds,
+          'odd_responses': _draftOddResponses
+              .map((index, response) => MapEntry(index.toString(), response)),
+          'feedback': _feedback,
+        });
   }
 
   Map<String, dynamic> _oddResponse(Map<String, dynamic> round, String itemId) {
@@ -226,10 +333,12 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
     };
   }
 
-  Future<void> _completeSession() async {
+  Future<void> _completeSession({bool alreadyCompleted = false}) async {
     if (_sessionId == null) return;
-    await _store.finishSession(_sessionId!, 'completed',
-        completedAt: DateTime.now().toUtc().toIso8601String());
+    if (!alreadyCompleted) {
+      await _store.finishSession(_sessionId!, 'completed',
+          completedAt: DateTime.now().toUtc().toIso8601String());
+    }
     if (mounted)
       setState(() {
         _stage = 'complete';
@@ -279,19 +388,23 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
       _selectedOddItem = itemId;
     });
     try {
-      await _saveResponses([_oddResponse(round, itemId)]);
+      final response = _oddResponse(round, itemId);
+      _draftOddResponses[_roundIndex] = response;
       final correct = itemId == round['expected_item_id'];
       if (mounted) {
         setState(() {
-          _oddResponseSaved = true;
           _feedback = correct
               ? 'Well done! ${round['explanation']}'
               : 'That’s okay. ${round['explanation']}';
         });
       }
+      await _saveCheckpoint(oddResponseSaved: true);
+      if (mounted) setState(() => _oddResponseSaved = true);
+      if (_roundIndex == 2) {
+        await _completeOddActivity();
+      }
       await _speak(
           '${spokenEncouragement(_languageCode, correct: correct)} ${_spoken((round['spoken'] as Map?)?[_languageCode]?['explanation'], fallback: round['explanation'].toString())}');
-      if (_roundIndex == 2) await _completeSession();
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
     } finally {
@@ -306,19 +419,23 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
       _error = null;
     });
     try {
-      await _saveResponses([_oddResponse(round, _selectedOddItem!)]);
+      final response = _oddResponse(round, _selectedOddItem!);
+      _draftOddResponses[_roundIndex] = response;
       if (mounted) {
         setState(() {
-          _oddResponseSaved = true;
           _feedback = _selectedOddItem == round['expected_item_id']
               ? 'Well done! ${round['explanation']}'
               : 'That’s okay. ${round['explanation']}';
         });
       }
+      await _saveCheckpoint(oddResponseSaved: true);
+      if (mounted) setState(() => _oddResponseSaved = true);
+      if (_roundIndex == 2) {
+        await _completeOddActivity();
+      }
       final correct = _selectedOddItem == round['expected_item_id'];
       await _speak(
           '${spokenEncouragement(_languageCode, correct: correct)} ${_spoken((round['spoken'] as Map?)?[_languageCode]?['explanation'], fallback: round['explanation'].toString())}');
-      if (_roundIndex == 2) await _completeSession();
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
     } finally {
@@ -326,15 +443,32 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
     }
   }
 
+  Future<void> _completeOddActivity() async {
+    final ownerId = _client.auth.currentUser?.id;
+    if (ownerId == null) {
+      throw StateError(
+          'Your saved caregiver account is not available on this device.');
+    }
+    final responses = <Map<String, dynamic>>[];
+    for (var index = 0; index < 3; index++) {
+      final response = _draftOddResponses[index];
+      if (response == null) {
+        throw StateError('Complete each round before finishing the activity.');
+      }
+      responses.add(response);
+    }
+    await _store.completeSessionWithResponses(_sessionId!, ownerId, responses);
+    await _completeSession(alreadyCompleted: true);
+  }
+
   Future<void> _finishSorting(Map<String, dynamic> sorting) async {
-    if (_busy || _placements.length != (sorting['items'] as List).length)
-      return;
+    final items = (sorting['items'] as List).cast<Map<String, dynamic>>();
+    if (_busy || _categorizedCount(items) != items.length) return;
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
-      final items = (sorting['items'] as List).cast<Map<String, dynamic>>();
       final responses = <Map<String, dynamic>>[];
       for (var index = 0; index < items.length; index++) {
         final item = items[index];
@@ -357,14 +491,22 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
           'responded_at': DateTime.now().toUtc().toIso8601String(),
         });
       }
-      await _saveResponses(responses);
-      await _completeSession();
+      final ownerId = _client.auth.currentUser!.id;
+      await _store.completeSessionWithResponses(
+          _sessionId!, ownerId, responses);
+      await _completeSession(alreadyCompleted: true);
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
+
+  int _categorizedCount(List<Map<String, dynamic>> items) =>
+      items.where((item) {
+        final value = _placements[item['id']];
+        return value != null && value.isNotEmpty;
+      }).length;
 
   Widget _bigButton(String label, VoidCallback? onPressed,
           {bool primary = true}) =>
@@ -593,19 +735,20 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
       ],
       if (_oddResponseSaved && _roundIndex < 2) ...[
         const SizedBox(height: KinCareSpace.x4),
-        _bigButton(
-            'Next Round',
-            () => setState(() {
-                  _roundIndex++;
-                  _selectedOddItem = null;
-                  _oddResponseSaved = false;
-                  _feedback = null;
-                })),
+        _bigButton('Next Round', () async {
+          setState(() {
+            _roundIndex++;
+            _selectedOddItem = null;
+            _oddResponseSaved = false;
+            _feedback = null;
+          });
+          await _saveCheckpoint();
+        }),
       ],
       if (_oddResponseSaved && _roundIndex == 2 && _stage != 'complete') ...[
         const SizedBox(height: KinCareSpace.x4),
         _bigButton(_busy ? 'Saving…' : 'Finish Activity',
-            _busy ? null : _completeSession),
+            _busy ? null : _completeOddActivity),
       ],
     ]));
   }
@@ -614,6 +757,7 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
     final items = (sorting['items'] as List).cast<Map<String, dynamic>>();
     final categories =
         (sorting['categories'] as List).cast<Map<String, dynamic>>();
+    final categorized = _categorizedCount(items);
     return _panel(
         Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       Text(sorting['instruction'].toString(),
@@ -631,6 +775,13 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
               fallback: sorting['instruction'].toString())),
           primary: false),
       const SizedBox(height: KinCareSpace.x4),
+      SortingGameProgress(
+        categorizedCount: categorized,
+        totalCount: items.length,
+        busy: _busy,
+        onFinish: () => _finishSorting(sorting),
+      ),
+      const SizedBox(height: KinCareSpace.x3),
       for (final item in items) ...[
         _sortingItem(item, categories),
         const SizedBox(height: KinCareSpace.x2),
@@ -646,13 +797,19 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
                     final selectedItem = items.firstWhere(
                       (item) => item['id'] == _selectedSortingItem,
                     );
+                    final updatedPlacements = replaceSortingPlacement(
+                        _placements,
+                        _selectedSortingItem!,
+                        category['id'].toString());
                     setState(() {
-                      _placements[_selectedSortingItem!] =
-                          category['id'].toString();
+                      _placements
+                        ..clear()
+                        ..addAll(updatedPlacements);
                       _selectedSortingItem = null;
                       _feedback =
                           'Object placed. Choose it again if you would like to move it.';
                     });
+                    unawaited(_saveCheckpoint());
                     _speak(spokenPlacement(
                       _languageCode,
                       _spoken(selectedItem['spoken'],
@@ -695,11 +852,6 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
             primary: false)
       ],
       const SizedBox(height: KinCareSpace.x4),
-      _bigButton(
-          _busy ? 'Saving your choices…' : 'Finish Sorting',
-          _placements.length == items.length && !_busy
-              ? () => _finishSorting(sorting)
-              : null),
     ]));
   }
 
@@ -711,11 +863,14 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
     return SizedBox(
       height: 82,
       child: OutlinedButton(
-        onPressed: () => setState(() {
-          _selectedSortingItem = item['id'].toString();
-          _feedback = 'Choose a group for ${item['label']}.';
-          _speak(_spoken(item['spoken'], fallback: item['label'].toString()));
-        }),
+        onPressed: () {
+          setState(() {
+            _selectedSortingItem = item['id'].toString();
+            _feedback = 'Choose a group for ${item['label']}.';
+            _speak(_spoken(item['spoken'], fallback: item['label'].toString()));
+          });
+          unawaited(_saveCheckpoint());
+        },
         style: OutlinedButton.styleFrom(
           backgroundColor: _selectedSortingItem == item['id']
               ? KinCareColors.paleSage
@@ -738,7 +893,7 @@ class _CognitiveGamesScreenState extends State<CognitiveGamesScreen> {
                       fontSize: 22,
                       fontWeight: FontWeight.w700,
                       color: KinCareColors.forest))),
-          Text(category == null ? 'Choose' : 'In ${category['label']}',
+          Text(category == null ? 'Not grouped' : 'In ${category['label']}',
               style: const TextStyle(
                   fontSize: 15, color: KinCareColors.textMuted)),
         ]),

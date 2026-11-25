@@ -37,11 +37,14 @@ flutter pub get
 flutter analyze
 flutter run --dart-define-from-file=dart-defines.json
 flutter build apk --debug --dart-define-from-file=dart-defines.json
+flutter build apk --release --target-platform android-arm,android-arm64,android-x64 --dart-define-from-file=dart-defines.json
 ```
 
 Copy `dart-defines.example.json` to `dart-defines.json`, add only the public URL and publishable key, and keep `dart-defines.json` untracked.
 
 The debug APK is written to `android_app/build/app/outputs/flutter-apk/app-debug.apk`. Transfer it to an Android phone (USB file transfer or an approved private file share), open it from Downloads, allow installation from that source if Android prompts, and install. Test email sign-in, caregiver profile CRUD, sign-out/session restoration, and the caregiver/elderly mode switch. No physical-device install test has been recorded yet.
+
+The universal release APK is written to `android_app/build/app/outputs/flutter-apk/app-release.apk` and includes ARM, ARM64 and x64 Android native libraries. Build with the local, ignored `dart-defines.json`; never commit that file or put credentials in Dart source.
 
 ### Prototype phone authentication
 
