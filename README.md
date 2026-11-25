@@ -1,55 +1,181 @@
-# KinCare — Care Beyond Connectivity
+# KinCare
+### Offline-First Cognitive Stimulation and Caregiver Support Platform
 
-Round 3 prototype repository for PRASUNEX Innovathon 2026.
+KinCare is an offline-first application designed to support older adults through personalised cognitive activities and help caregivers provide meaningful engagement.
 
-## Applications
+The platform allows caregivers to create memory decks using familiar photographs and descriptions. Older adults can use these decks and interactive activities to stimulate memory, recognition, and everyday thinking skills.
 
-- `android_app/` — Flutter/Dart Android application.
-- `pwa/` — React/TypeScript installable Progressive Web App.
-- `supabase/` — shared Supabase migrations, RLS policies and safe demo seed data.
-- `docs/` — product specification, contracts, offline strategy, testing and submission evidence.
+KinCare is designed to remain useful even when internet connectivity is unavailable. Activities and progress can be stored locally and synchronised with the cloud when a connection becomes available.
 
-Both applications must support caregiver and elderly journeys and use the same Supabase backend. Read `AGENTS.md` and `docs/KINCARE_ROUND3_MASTER_SPEC.md` before making changes.
+---
 
-## First-time setup
+## The Problem
 
-### Supabase
+Older adults experiencing memory and cognitive difficulties may benefit from regular, familiar, and engaging activities. However, caregivers often face challenges in creating personalised activities and maintaining consistent engagement.
 
-Apply the ordered SQL migrations in `supabase/migrations/` to the project through the Supabase SQL editor or a linked Supabase CLI. No service-role key is required for application configuration.
+Internet connectivity can also be unreliable, limiting access to applications that depend entirely on cloud services.
 
-### PWA
+KinCare addresses these challenges through personalised memory activities, simple interactive games, and offline-first functionality.
 
-```powershell
-cd pwa
-npm install
-npm run dev
+## Key Features
+
+### 1. Personalised Memory Decks
+- Caregivers can create memory decks using photographs and descriptions.
+- Familiar images help provide context for memory-based activities.
+- Decks and cards are available for offline use after being stored locally.
+
+### 2. Cognitive Activities
+- **Odd One Out:** Identify the item that does not belong in a group.
+- **Everyday Object Sorting:** Sort familiar objects into appropriate categories.
+- Interactive activities designed around recognition, attention, and basic reasoning.
+
+### 3. Offline-First Functionality
+- Local data storage using SQLite.
+- Cached memory decks and activity data.
+- Offline actions are recorded locally.
+- A synchronisation queue processes pending changes when connectivity returns.
+- Manual and automatic synchronisation support.
+
+### 4. Caregiver Support
+- Caregiver authentication.
+- Memory deck and activity management.
+- Activity history and engagement reporting.
+- Local activity records that can be synchronised with the cloud.
+
+### 5. Accessible Interaction
+- Simple interfaces designed for older adults.
+- Spoken prompts and multilingual support, including English, Hindi, and Marathi.
+
+---
+
+## Technology Stack
+
+| Component | Technology |
+|---|---|
+| Android application | Flutter, Dart |
+| Local database | SQLite (sqflite) |
+| Cloud backend | Supabase |
+| Authentication | Supabase Auth |
+| Cloud database | Supabase PostgreSQL |
+| Cloud media storage | Supabase Storage |
+| Offline synchronisation | Local sync queue and Sync Manager |
+| Version control | Git and GitHub |
+
+## How Offline Synchronisation Works
+
+KinCare follows an offline-first approach. The application does not require a continuous internet connection for its locally available activities.
+
+1. **Local access:** The application loads cached data from SQLite.
+2. **User activity:** New actions and changes are stored locally.
+3. **Pending synchronisation:** Changes are added to a local synchronisation queue.
+4. **Connectivity restored:** The Sync Manager detects an available connection and processes pending operations.
+5. **Cloud update:** Data is synchronised with Supabase.
+6. **Updated local state:** The application refreshes its local data while retaining access to offline content.
+
+This approach helps maintain continuity when connectivity is intermittent.
+
+## Project Structure
+
+```text
+kincare-round3/
+│
+├── android_app/
+│   ├── android/
+│   ├── lib/
+│   │   ├── main.dart
+│   │   ├── memory_decks_screen.dart
+│   │   ├── elderly_memory_screen.dart
+│   │   ├── cognitive_games_screen.dart
+│   │   ├── offline_store.dart
+│   │   ├── offline_sync.dart
+│   │   └── ...
+│   │
+│   ├── test/
+│   ├── pubspec.yaml
+│   └── ...
+│
+├── docs/
+│   └── reports/
+│
+└── README.md
 ```
 
-Local PWA credentials are in the ignored `pwa/.env.local`. Copy `pwa/.env.example` to `.env.local` for another checkout.
+## Getting Started
 
-### Flutter Android
+### Prerequisites
+- Flutter SDK
+- Dart SDK
+- Android Studio or Android SDK
+- A Supabase project with the required database and storage configuration
 
-Flutter must be installed and on `PATH`.
+### Run Locally
 
-```powershell
-cd android_app
+Clone the repository:
+
+```bash
+git clone https://github.com/talha7931/kincare-round3.git
+```
+
+Navigate to the Android application:
+
+```bash
+cd kincare-round3/android_app
+```
+
+Install dependencies:
+
+```bash
 flutter pub get
-flutter analyze
-flutter run --dart-define-from-file=dart-defines.json
-flutter build apk --debug --dart-define-from-file=dart-defines.json
-flutter build apk --release --target-platform android-arm,android-arm64,android-x64 --dart-define-from-file=dart-defines.json
 ```
 
-Copy `dart-defines.example.json` to `dart-defines.json`, add only the public URL and publishable key, and keep `dart-defines.json` untracked.
+Configure the required Supabase credentials using the project's expected local configuration. Do not commit private keys or credentials to GitHub.
 
-The debug APK is written to `android_app/build/app/outputs/flutter-apk/app-debug.apk`. Transfer it to an Android phone (USB file transfer or an approved private file share), open it from Downloads, allow installation from that source if Android prompts, and install. Test email sign-in, caregiver profile CRUD, sign-out/session restoration, and the caregiver/elderly mode switch. No physical-device install test has been recorded yet.
+Run the application:
 
-The universal release APK is written to `android_app/build/app/outputs/flutter-apk/app-release.apk` and includes ARM, ARM64 and x64 Android native libraries. Build with the local, ignored `dart-defines.json`; never commit that file or put credentials in Dart source.
+```bash
+flutter run
+```
 
-### Prototype phone authentication
+## Testing
 
-Phone auth calls Supabase Auth's real SMS OTP endpoints; it does not generate or verify codes locally. Before testing, configure Supabase Auth Phone, add test phone number/fixed OTP pairs in the Supabase Dashboard, and complete any SMS-provider configuration Supabase requires. Test phone numbers do not send SMS, but the hosted provider requirement still applies. No phone numbers, OTPs, or provider credentials are stored in client source, and no hosted Auth settings were changed during implementation.
+The project includes automated tests covering important application behaviour, including:
 
-## Project status
+- Offline database operations.
+- Memory card and deck synchronisation.
+- Cognitive game functionality.
+- Authentication and network diagnostics.
+- Offline data handling.
 
-Phase 1 schema/RLS and PWA/Flutter source scaffolds are in progress. A feature is not complete until its real-project acceptance test passes and its status is recorded in `docs/IMPLEMENTED_FEATURES_AND_LIMITATIONS.md`.
+## Current Limitations
+
+- Cloud synchronisation requires an internet connection.
+- Previously cached content is available offline; new cloud content requires connectivity to retrieve.
+- The current implementation is a prototype and has not been clinically validated.
+- Additional physical-device testing and broader accessibility evaluation are needed.
+
+## Future Roadmap
+
+The following improvements are planned for future development:
+
+- **Time Credits Module:** Introduce a time-credit system to recognise and encourage caregiver participation and support.
+- **Expanded Cognitive Activities:** Add more personalised games and memory exercises.
+- **Caregiver Wellbeing:** Provide guidance and resources to support caregivers.
+- **Improved Accessibility:** Expand language options, voice interaction, and accessibility settings.
+- **Enhanced Synchronisation:** Further improve conflict handling, reliability, and data recovery.
+- **Further Testing:** Conduct broader usability testing with caregivers and older adults.
+
+## Demo and Project Resources
+
+- **GitHub Repository:** https://github.com/talha7931/kincare-round3
+- **Prototype / APK:** [Add Google Drive link]
+- **Prototype Demonstration:** [Add video link]
+- **Project Explanation Video:** [Add video link]
+- **Technical Documentation:** [Add documentation link]
+
+## Disclaimer
+
+KinCare is a cognitive stimulation and caregiver-support prototype. It is not a medical device and is not intended to diagnose, treat, or replace professional medical care.
+
+---
+
+**KinCare — Making familiar moments meaningful through technology.**
