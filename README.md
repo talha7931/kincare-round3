@@ -167,10 +167,8 @@ The following improvements are planned for future development:
 ## Demo and Project Resources
 
 - **GitHub Repository:** https://github.com/talha7931/kincare-round3
-- **Prototype / APK:** [Add Google Drive link]
-- **Prototype Demonstration:** [Add video link]
-- **Project Explanation Video:** [Add video link]
-- **Technical Documentation:** [Add documentation link]
+- **Project Explanation Video:** https://drive.google.com/drive/folders/1TMXi_W6k-ONsviEjYIlVi-6cuzL5jjPp
+
 
 ## Disclaimer
 
