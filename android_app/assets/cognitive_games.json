@@ -1,0 +1,71 @@
+{
+  "odd_one_out": [
+    {
+      "id": "fruit-chair",
+      "instruction": "Look at these things. Which one is not a fruit?",
+      "explanation": "A chair is different because the apple, banana, and mango are fruits.",
+      "spoken": {
+        "hi": { "instruction": "इन चीज़ों को देखिए। इनमें से कौन-सी चीज़ फल नहीं है?", "explanation": "कुर्सी अलग है, क्योंकि सेब, केला और आम फल हैं।" },
+        "mr": { "instruction": "या वस्तू पाहा. यांपैकी फळ कोणते नाही?", "explanation": "खुर्ची वेगळी आहे, कारण सफरचंद, केळे आणि आंबा ही फळे आहेत." }
+      },
+      "expected_item_id": "chair",
+      "items": [
+        { "id": "apple", "label": "Apple", "spoken": { "hi": "सेब", "mr": "सफरचंद" }, "illustration": "🍎" },
+        { "id": "banana", "label": "Banana", "spoken": { "hi": "केला", "mr": "केळे" }, "illustration": "🍌" },
+        { "id": "mango", "label": "Mango", "spoken": { "hi": "आम", "mr": "आंबा" }, "illustration": "🥭" },
+        { "id": "chair", "label": "Chair", "spoken": { "hi": "कुर्सी", "mr": "खुर्ची" }, "illustration": "🪑" }
+      ]
+    },
+    {
+      "id": "animals-bus",
+      "instruction": "Which one is not an animal?",
+      "explanation": "A bus is different because the cat, dog, and cow are animals.",
+      "spoken": {
+        "hi": { "instruction": "इनमें से कौन-सी चीज़ जानवर नहीं है?", "explanation": "बस अलग है, क्योंकि बिल्ली, कुत्ता और गाय जानवर हैं।" },
+        "mr": { "instruction": "यांपैकी प्राणी कोणता नाही?", "explanation": "बस वेगळी आहे, कारण मांजर, कुत्रा आणि गाय हे प्राणी आहेत." }
+      },
+      "expected_item_id": "bus",
+      "items": [
+        { "id": "cat", "label": "Cat", "spoken": { "hi": "बिल्ली", "mr": "मांजर" }, "illustration": "🐈" },
+        { "id": "dog", "label": "Dog", "spoken": { "hi": "कुत्ता", "mr": "कुत्रा" }, "illustration": "🐕" },
+        { "id": "cow", "label": "Cow", "spoken": { "hi": "गाय", "mr": "गाय" }, "illustration": "🐄" },
+        { "id": "bus", "label": "Bus", "spoken": { "hi": "बस", "mr": "बस" }, "illustration": "🚌" }
+      ]
+    },
+    {
+      "id": "clothes-pot",
+      "instruction": "Which one is not something we wear?",
+      "explanation": "The cooking pot is different because the shirt, shoes, and hat are things we wear.",
+      "spoken": {
+        "hi": { "instruction": "इनमें से कौन-सी चीज़ हम नहीं पहनते?", "explanation": "खाना पकाने का बर्तन अलग है, क्योंकि कमीज़, जूते और टोपी पहने जाते हैं।" },
+        "mr": { "instruction": "यांपैकी आपण काय घालत नाही?", "explanation": "स्वयंपाकाचे भांडे वेगळे आहे, कारण शर्ट, बूट आणि टोपी आपण घालतो." }
+      },
+      "expected_item_id": "pot",
+      "items": [
+        { "id": "shirt", "label": "Shirt", "spoken": { "hi": "कमीज़", "mr": "शर्ट" }, "illustration": "👕" },
+        { "id": "shoes", "label": "Shoes", "spoken": { "hi": "जूते", "mr": "बूट" }, "illustration": "👟" },
+        { "id": "hat", "label": "Hat", "spoken": { "hi": "टोपी", "mr": "टोपी" }, "illustration": "🧢" },
+        { "id": "pot", "label": "Cooking pot", "spoken": { "hi": "खाना पकाने का बर्तन", "mr": "स्वयंपाकाचे भांडे" }, "illustration": "🍲" }
+      ]
+    }
+  ],
+  "everyday_object_sorting": {
+    "instruction": "Place each object in the group where it belongs.",
+    "spoken": {
+      "hi": { "instruction": "हर चीज़ को उस समूह में रखें जहाँ वह सही लगती है।", "placed": "आपने {item} को {category} वाले समूह में रखा है। चाहें तो इसे बदल सकते हैं।", "complete": "गतिविधि पूरी हुई। भाग लेने के लिए धन्यवाद।" },
+      "mr": { "instruction": "प्रत्येक वस्तू योग्य गटात ठेवा.", "placed": "तुम्ही {item} ही वस्तू {category} गटात ठेवली आहे. हवे असल्यास ती बदलू शकता.", "complete": "उपक्रम पूर्ण झाला. सहभागी झाल्याबद्दल धन्यवाद." }
+    },
+    "categories": [
+      { "id": "fruit", "label": "Fruits", "spoken": { "hi": "फल", "mr": "फळे" }, "illustration": "🍎" },
+      { "id": "vegetable", "label": "Vegetables", "spoken": { "hi": "सब्ज़ियाँ", "mr": "भाज्या" }, "illustration": "🥕" }
+    ],
+    "items": [
+      { "id": "apple", "label": "Apple", "spoken": { "hi": "सेब", "mr": "सफरचंद" }, "illustration": "🍎", "category_id": "fruit" },
+      { "id": "banana", "label": "Banana", "spoken": { "hi": "केला", "mr": "केळे" }, "illustration": "🍌", "category_id": "fruit" },
+      { "id": "mango", "label": "Mango", "spoken": { "hi": "आम", "mr": "आंबा" }, "illustration": "🥭", "category_id": "fruit" },
+      { "id": "carrot", "label": "Carrot", "spoken": { "hi": "गाजर", "mr": "गाजर" }, "illustration": "🥕", "category_id": "vegetable" },
+      { "id": "potato", "label": "Potato", "spoken": { "hi": "आलू", "mr": "बटाटा" }, "illustration": "🥔", "category_id": "vegetable" },
+      { "id": "cabbage", "label": "Cabbage", "spoken": { "hi": "पत्तागोभी", "mr": "कोबी" }, "illustration": "🥬", "category_id": "vegetable" }
+    ]
+  }
+}

@@ -13,8 +13,43 @@ Both applications must support caregiver and elderly journeys and use the same S
 
 ## First-time setup
 
-Setup commands will be documented here once the team selects final dependency versions and adds the initial application scaffolds. Do not copy secrets into this README. Use an untracked local `.env` file and `.env.example` containing variable names only.
+### Supabase
+
+Apply the ordered SQL migrations in `supabase/migrations/` to the project through the Supabase SQL editor or a linked Supabase CLI. No service-role key is required for application configuration.
+
+### PWA
+
+```powershell
+cd pwa
+npm install
+npm run dev
+```
+
+Local PWA credentials are in the ignored `pwa/.env.local`. Copy `pwa/.env.example` to `.env.local` for another checkout.
+
+### Flutter Android
+
+Flutter must be installed and on `PATH`.
+
+```powershell
+cd android_app
+flutter pub get
+flutter analyze
+flutter run --dart-define-from-file=dart-defines.json
+flutter build apk --debug --dart-define-from-file=dart-defines.json
+flutter build apk --release --target-platform android-arm,android-arm64,android-x64 --dart-define-from-file=dart-defines.json
+```
+
+Copy `dart-defines.example.json` to `dart-defines.json`, add only the public URL and publishable key, and keep `dart-defines.json` untracked.
+
+The debug APK is written to `android_app/build/app/outputs/flutter-apk/app-debug.apk`. Transfer it to an Android phone (USB file transfer or an approved private file share), open it from Downloads, allow installation from that source if Android prompts, and install. Test email sign-in, caregiver profile CRUD, sign-out/session restoration, and the caregiver/elderly mode switch. No physical-device install test has been recorded yet.
+
+The universal release APK is written to `android_app/build/app/outputs/flutter-apk/app-release.apk` and includes ARM, ARM64 and x64 Android native libraries. Build with the local, ignored `dart-defines.json`; never commit that file or put credentials in Dart source.
+
+### Prototype phone authentication
+
+Phone auth calls Supabase Auth's real SMS OTP endpoints; it does not generate or verify codes locally. Before testing, configure Supabase Auth Phone, add test phone number/fixed OTP pairs in the Supabase Dashboard, and complete any SMS-provider configuration Supabase requires. Test phone numbers do not send SMS, but the hosted provider requirement still applies. No phone numbers, OTPs, or provider credentials are stored in client source, and no hosted Auth settings were changed during implementation.
 
 ## Project status
 
-Pre-implementation starter pack. A feature is not complete until its acceptance test passes and its status is recorded in `docs/IMPLEMENTED_FEATURES_AND_LIMITATIONS.md`.
+Phase 1 schema/RLS and PWA/Flutter source scaffolds are in progress. A feature is not complete until its real-project acceptance test passes and its status is recorded in `docs/IMPLEMENTED_FEATURES_AND_LIMITATIONS.md`.

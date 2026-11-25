@@ -19,6 +19,7 @@ build/
 .flutter-plugins
 .flutter-plugins-dependencies
 android/local.properties
+android_app/dart-defines.json
 
 # IDE / OS
 .DS_Store
@@ -29,3 +30,4 @@ Thumbs.db
 # Local logs and temp files
 *.log
 *.tmp
+/local_build_config.bat

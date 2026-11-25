@@ -16,26 +16,41 @@ Use the exact fields and relationships in `docs/KINCARE_ROUND3_MASTER_SPEC.md`, 
 
 ## Stable activity response payloads
 
-Use JSON objects with a version field so clients can evolve safely. Proposed baseline:
+Use JSON objects with a version field so clients can evolve safely. The Phase 3 games use these payloads and the existing `response_index` / `is_correct` columns:
 
 ```json
 {
   "schema_version": 1,
   "activity_type": "odd_one_out",
-  "selected_item_id": "item-uuid",
-  "expected_item_id": "other-uuid"
+  "round_id": "fruit-chair",
+  "selected_item_id": "chair",
+  "expected_item_id": "chair"
 }
 ```
 
 ```json
 {
   "schema_version": 1,
-  "activity_type": "object_sorting",
-  "placements": [
-    { "item_id": "item-uuid", "category_id": "category-uuid" }
-  ]
+  "activity_type": "everyday_object_sorting",
+  "item_id": "apple",
+  "selected_category_id": "fruit",
+  "expected_category_id": "fruit"
 }
 ```
+
+Odd One Out writes one response per round; `response_index` is the zero-based
+round index and `is_correct` records whether the selected item matches the
+round's expected item. Everyday Object Sorting writes one response per object
+when the elderly user confirms the completed sort; `response_index` is the
+zero-based object index and `is_correct` records whether its final category
+matches the intended category. Sorting choices remain editable in local screen
+state until the user finishes, so corrections do not overwrite append-only
+cloud responses.
+
+Both games use the existing `ACTIVITY_TYPES.stable_key` values
+`odd_one_out` and `everyday_object_sorting`. A session references the active
+profile and a caregiver-owned `ENROLLED_DEVICES` row. No Phase 3 schema changes
+are required.
 
 ```json
 {
@@ -58,21 +73,32 @@ For recorded audio, store the file in private Supabase Storage and link it throu
 
 ## Reporting contract
 
-The report query/model must include the selected elderly profile, reporting period, sessions, activity types, statuses, recorded responses and caregiver observations. It must also expose pending-local-sync status where relevant, because the cloud may not yet contain all local data.
+The report query/model must include the selected elderly profile, reporting period, sessions, activity types, statuses and recorded responses. Each client may include caregiver observations supplied while preparing that report. It must expose pending-local-sync status where relevant; the current report screens read cloud rows and must label their coverage as synced cloud activity.
+
+Reports use only rows visible to the signed-in caregiver through existing RLS. They do not use service-role credentials or client-side ownership checks as a substitute for RLS. No reporting table or schema extension is required for the current cloud-backed summary.
 
 ## Dashboard aggregation definitions
 
-- Total sessions: count of sessions in the selected profile/date range, excluding locally pending records only when the dashboard is explicitly cloud-only; otherwise label local vs synced totals.
+- Reporting period: inclusive UTC calendar dates, filtered against `ACTIVITY_SESSIONS.started_at`. Both clients display that the period uses UTC.
+- Total elderly profiles: count of profiles returned by the caregiver-scoped profile query.
+- Total sessions: count of caregiver-visible cloud sessions in the selected profile/date range. Label the coverage as synced cloud activity; do not imply that locally pending records are included.
 - Sessions by activity: count grouped by activity type.
-- Participation days: distinct local calendar dates with at least one session, using a documented timezone rule.
-- Completion rate: completed sessions divided by all sessions with a known final status; do not treat in-progress/unknown as failed.
+- Daily engagement: distinct UTC dates with at least one session in the selected period; weekly engagement groups those UTC dates by ISO week (Monday through Sunday).
+- Session frequency: total sessions divided by the number of UTC calendar days in the selected period; include the denominator in the report.
+- Completion rate: completed sessions divided by completed plus abandoned sessions; exclude in-progress sessions because their final outcome is unknown.
+- Duration: there is no duration column. Derive elapsed time only when both `started_at` and `completed_at` exist; otherwise report duration as unavailable. This is elapsed session time, not active engagement time.
 - Correctness: display only for structured activities where `is_correct` is meaningful. Never score open-ended Memory Deck reminiscence.
+- Response summaries: render fields by stable `response_payload.activity_type`; do not treat Memory Deck payloads as sorting responses. Keep report language factual and non-clinical.
+- Every PDF includes the caregiver-visible profile display name, caregiver display name when available, UTC reporting period, generation date, metric definitions/coverage, applicable activity history, optional caregiver observations and the non-clinical disclaimer.
 
 ## Sync contract
 
 - Client-generated UUIDs for offline-created records.
-- Upsert/idempotent cloud writes keyed by stable IDs.
+- Retrying a session with an existing stable ID must verify the existing elderly profile and device IDs before accepting it as already persisted or updating its final status.
+- Responses are append-only inserts keyed by their stable IDs. On retry, an existing matching response is accepted as persisted; an ID collision with another session/caregiver is an error. Clients must not update response rows.
 - Upload binary media before inserting/updating metadata rows that reference the uploaded file.
 - Session/response records are append-only for the MVP.
 - Store sync state locally: `pending`, `syncing`, `synced`, `failed`.
 - Never mark synced until the server confirms the write.
+- Before sync, verify the current authenticated caregiver, caregiver-visible elderly profile, and caregiver-owned enrolled device; reject missing or revoked devices without dropping the local queued data.
+- Local activity histories may include pending/failed rows; Phase 4 dashboard and report totals remain scoped to cloud-synced rows and must say so.
