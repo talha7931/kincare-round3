@@ -281,8 +281,7 @@ The following items are **planned, not implemented commitments**:
 ## Demo and Project Resources
 
 - **GitHub repository:** [talha7931/kincare-round3](https://github.com/talha7931/kincare-round3)
-- **PWA demo:** _No public deployment URL is listed yet._
-- **Android APK:** _No hosted release download is listed; use the build instructions above._
+- **Android APK:** (https://drive.google.com/file/d/17DHLpigOYhjbNCdKA7VzqfnXcRbvLCwU/view?usp=sharing)
 - **Project video folder:** [Existing Google Drive link](https://drive.google.com/drive/folders/1TMXi_W6k-ONsviEjYIlVi-6cuzL5jjPp) — its current access settings have not been verified.
 - **Project specification:** [KinCare Round 3 master spec](docs/KINCARE_ROUND3_MASTER_SPEC.md)
 - **Implemented scope and limitations:** [Feature status](docs/IMPLEMENTED_FEATURES_AND_LIMITATIONS.md)
